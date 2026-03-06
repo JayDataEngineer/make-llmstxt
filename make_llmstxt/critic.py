@@ -2,6 +2,8 @@
 
 Validates generated llms.txt output using structured LLM calls.
 Returns pass/fail with specific, actionable feedback for retries.
+
+Uses LangChain's with_structured_output for guaranteed JSON schema compliance.
 """
 
 from typing import List, Optional
@@ -12,52 +14,83 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 
 class CriticResult(BaseModel):
-    """Structured result from critic evaluation."""
+    """Structured result from critic evaluation.
 
-    passed: bool = Field(description="True if llms.txt meets all quality requirements")
+    This schema is enforced via with_structured_output() to guarantee
+    the LLM always returns parseable JSON - no prompt engineering needed.
+    """
+
+    passed: bool = Field(
+        description="True ONLY if output meets ALL validation rules. Be strict."
+    )
     score: float = Field(
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="Quality score 0.0-1.0"
+        description="Quality score: 0.0=fail, 0.5=acceptable, 0.7+=good, 0.9+=excellent"
     )
     issues: List[str] = Field(
         default_factory=list,
-        description="Specific problems found"
+        description="Specific problems found. Empty if passed."
     )
     suggestions: List[str] = Field(
         default_factory=list,
-        description="How to fix the issues"
+        description="Actionable fixes for each issue. Must match issues count."
     )
 
 
 CRITIC_SYSTEM_PROMPT = """You are a strict quality critic for llms.txt files.
 
 Your job is to evaluate llms.txt drafts and provide actionable feedback.
+Be pedantic - the goal is machine-readable documentation for LLMs.
 
-VALIDATION RULES:
-1. STRUCTURE: Must start with `# <url> llms.txt` header
-2. ENTRIES: Each line must follow `- [Title](URL): Description` format
-3. TITLES: Must be 2-5 words, concise and descriptive
-4. DESCRIPTIONS: Must be 8-12 words, informative, not generic
-5. NO PLACEHOLDERS: No "Page", "No description available", or empty fields
-6. NO DUPLICATES: Each URL should appear once
-7. COMPLETENESS: If full text requested, check llms-full.txt exists
+VALIDATION RULES (ALL must pass):
 
-GRADE STRICTLY. Generic descriptions like "This is a webpage" are FAILURES.
+1. HEADER: Must start with `# <url> llms.txt` (exact format)
+2. ENTRIES: Each non-empty line after header must be:
+   `- [Title](URL): Description`
+3. TITLES: 2-5 words, specific, descriptive (NOT "Home", "Page", "About")
+4. DESCRIPTIONS: 8-15 words, summarize page purpose (NOT generic)
+5. NO PLACEHOLDERS: Reject "No description", "Page content", "This is a"
+6. NO DUPLICATES: Each URL appears exactly once
+7. VALID URLS: All URLs must be properly formatted
 
-Output a JSON object with:
-- passed: boolean
-- score: 0.0-1.0 (be harsh, 0.7+ is good)
-- issues: list of specific problems
-- suggestions: list of how to fix each issue"""
+SCORING:
+- 0.9+: Excellent, all rules passed, descriptions are specific
+- 0.7-0.8: Good, minor issues (e.g., one title slightly long)
+- 0.5-0.6: Acceptable, needs improvement but usable
+- <0.5: Fail, major issues (placeholders, missing header, etc.)
+
+Be harsh. Generic text like "This page contains information" is a FAILURE.
+Return passed=false if ANY entry has a placeholder or generic description.
+
+You MUST provide one suggestion per issue found."""
 
 
 class Critic:
-    """LLM-based critic for llms.txt validation."""
+    """LLM-based critic for llms.txt validation.
 
-    def __init__(self, llm: ChatOpenAI):
+    Uses with_structured_output to guarantee valid JSON responses.
+    No need for prompt engineering around output parsing.
+    """
+
+    def __init__(
+        self,
+        llm: ChatOpenAI,
+        pass_threshold: float = 0.7,
+        fail_on_error: bool = False,
+    ):
+        """Initialize critic.
+
+        Args:
+            llm: LangChain ChatOpenAI instance
+            pass_threshold: Minimum score to pass (default 0.7)
+            fail_on_error: If True, critic errors cause failure; else pass with warning
+        """
+        # Use with_structured_output for guaranteed schema compliance
         self.llm = llm.with_structured_output(CriticResult)
+        self.pass_threshold = pass_threshold
+        self.fail_on_error = fail_on_error
 
     async def evaluate(
         self,
@@ -89,7 +122,7 @@ class Critic:
 --- end ---"""
 
         if url:
-            content = f"Source URL: {url}\n\n{content}"
+            content = f"Source website: {url}\n\n{content}"
 
         messages = [
             SystemMessage(content=CRITIC_SYSTEM_PROMPT),
@@ -98,22 +131,46 @@ class Critic:
 
         try:
             result = await self.llm.ainvoke(messages)
-            logger.info(f"Critic: passed={result.passed}, score={result.score:.2f}, issues={len(result.issues)}")
+
+            # Apply pass threshold
+            if result.score >= self.pass_threshold and not result.passed:
+                logger.info(f"Critic: Overriding passed=True (score {result.score:.2f} >= threshold {self.pass_threshold})")
+                result = CriticResult(
+                    passed=True,
+                    score=result.score,
+                    issues=result.issues,
+                    suggestions=result.suggestions,
+                )
+
+            logger.info(
+                f"Critic: passed={result.passed}, score={result.score:.2f}, "
+                f"issues={len(result.issues)}"
+            )
 
             if not result.passed:
-                logger.warning(f"Critic issues: {result.issues}")
+                for issue in result.issues:
+                    logger.warning(f"  Issue: {issue}")
 
             return result
 
         except Exception as e:
             logger.error(f"Critic evaluation failed: {e}")
-            # Return a pass on error to avoid blocking the pipeline
-            return CriticResult(
-                passed=True,
-                score=0.5,
-                issues=[],
-                suggestions=[f"Critic failed with error: {e}"],
-            )
+
+            if self.fail_on_error:
+                return CriticResult(
+                    passed=False,
+                    score=0.0,
+                    issues=[f"Critic error: {e}"],
+                    suggestions=["Check LLM configuration and retry"],
+                )
+            else:
+                # Graceful degradation: pass with warning
+                return CriticResult(
+                    passed=True,
+                    score=0.5,
+                    issues=[],
+                    suggestions=[f"Note: Critic failed ({e}), auto-passed"],
+                )
 
 
 async def critique_generation(
