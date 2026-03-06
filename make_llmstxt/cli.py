@@ -134,6 +134,29 @@ Environment Variables:
         action="store_true",
         help="Don't generate llms-full.txt file",
     )
+    # Critic options
+    parser.add_argument(
+        "--no-critic",
+        action="store_true",
+        help="Disable critic validation (faster but lower quality)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Max retry attempts on critic failure (default: 2)",
+    )
+    parser.add_argument(
+        "--pass-threshold",
+        type=float,
+        default=0.7,
+        help="Minimum score to pass critic, 0.0-1.0 (default: 0.7)",
+    )
+    parser.add_argument(
+        "--critic-strict",
+        action="store_true",
+        help="Fail generation if critic errors occur",
+    )
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -266,6 +289,10 @@ Environment Variables:
                     include_full_text=not args.no_full_text,
                     output_dir=Path(args.output_dir),
                     progress_callback=progress_callback,
+                    enable_critic=not args.no_critic,
+                    max_retries=args.max_retries,
+                    pass_threshold=args.pass_threshold,
+                    fail_on_critic_error=args.critic_strict,
                 )
             )
 

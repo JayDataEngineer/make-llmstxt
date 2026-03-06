@@ -72,6 +72,8 @@ class LLMsTxtGenerator:
         config: AppConfig,
         llm: Optional[ChatOpenAI] = None,
         scraper: Optional[ScraperClient] = None,
+        pass_threshold: float = 0.7,
+        fail_on_critic_error: bool = False,
     ):
         """Initialize generator.
 
@@ -79,15 +81,23 @@ class LLMsTxtGenerator:
             config: Application configuration
             llm: Optional pre-configured LLM instance
             scraper: Optional pre-configured scraper client
+            pass_threshold: Minimum critic score to pass (0.0-1.0)
+            fail_on_critic_error: Fail generation if critic errors
         """
         self.config = config
         self._external_scraper = scraper is not None
+        self.pass_threshold = pass_threshold
+        self.fail_on_critic_error = fail_on_critic_error
 
         # Create LLM if not provided
         self.llm = llm or create_llm(config.llm)
 
-        # Create critic using same LLM
-        self.critic = Critic(self.llm)
+        # Create critic using same LLM with configurable thresholds
+        self.critic = Critic(
+            self.llm,
+            pass_threshold=pass_threshold,
+            fail_on_error=fail_on_critic_error,
+        )
 
         # Use provided scraper or create based on config
         if scraper is not None:
@@ -350,6 +360,8 @@ async def generate_llmstxt(
     progress_callback: Optional[callable] = None,
     enable_critic: bool = True,
     max_retries: int = 2,
+    pass_threshold: float = 0.7,
+    fail_on_critic_error: bool = False,
 ) -> GenerationResult:
     """Generate llms.txt files for a website.
 
@@ -362,6 +374,8 @@ async def generate_llmstxt(
         progress_callback: Progress callback
         enable_critic: Enable critic validation
         max_retries: Max retry attempts
+        pass_threshold: Minimum score to pass (0.0-1.0)
+        fail_on_critic_error: Fail if critic errors
 
     Returns:
         GenerationResult
@@ -371,7 +385,11 @@ async def generate_llmstxt(
     load_dotenv()
 
     config = config or AppConfig.from_env()
-    generator = LLMsTxtGenerator(config)
+    generator = LLMsTxtGenerator(
+        config,
+        pass_threshold=pass_threshold,
+        fail_on_critic_error=fail_on_critic_error,
+    )
 
     try:
         result = await generator.generate(
