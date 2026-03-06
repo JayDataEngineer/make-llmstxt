@@ -5,14 +5,12 @@ Provides:
 - URL scraping (extract markdown content)
 """
 
-import logging
 from typing import Optional, List, Dict, Any
 
+from loguru import logger
 import httpx
 
 from .config import FirecrawlConfig
-
-logger = logging.getLogger(__name__)
 
 
 class FirecrawlClient:

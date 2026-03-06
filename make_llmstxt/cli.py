@@ -1,30 +1,21 @@
 """Command-line interface for make-llmstxt."""
 
 import argparse
-import logging
 import os
 import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+from loguru import logger
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .config import AppConfig, LLMConfig, PROVIDER_PROFILES
 from .generator import generate_llmstxt
 from .__init__ import __version__
+from .logging import setup_logging
 
 console = Console()
-
-
-def setup_logging(verbose: bool = False):
-    """Setup logging configuration."""
-    level = logging.DEBUG if verbose else logging.INFO
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
 
 
 def list_providers():
@@ -75,6 +66,10 @@ Environment Variables:
   OPENROUTER_API_KEY OpenRouter API key
   ZAI_API_KEY        ZAI API key
   FIRECRAWL_API_KEY  Firecrawl API key
+
+  LOG_LEVEL          Log level (DEBUG, INFO, WARNING, ERROR)
+  LOG_FILE           Path to log file (optional)
+  LOG_JSON           Use JSON log format (true/false)
         """,
     )
 
@@ -142,7 +137,16 @@ Environment Variables:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable verbose logging",
+        help="Enable verbose (DEBUG) logging",
+    )
+    parser.add_argument(
+        "--log-file",
+        help="Path to log file",
+    )
+    parser.add_argument(
+        "--log-json",
+        action="store_true",
+        help="Use JSON log format",
     )
     parser.add_argument(
         "--list-providers",
@@ -155,8 +159,18 @@ Environment Variables:
     # Load .env file
     load_dotenv()
 
-    # Setup logging
-    setup_logging(args.verbose)
+    # Setup logging with loguru
+    log_level = "DEBUG" if args.verbose else os.getenv("LOG_LEVEL", "INFO").upper()
+    log_file = Path(args.log_file) if args.log_file else (Path(os.getenv("LOG_FILE")) if os.getenv("LOG_FILE") else None)
+    log_json = args.log_json or os.getenv("LOG_JSON", "false").lower() == "true"
+
+    setup_logging(
+        level=log_level,
+        log_file=log_file,
+        json_format=log_json,
+    )
+
+    logger.info(f"make-llmstxt v{__version__} starting up")
 
     # List providers if requested
     if args.list_providers:
@@ -169,6 +183,7 @@ Environment Variables:
 
     # Build configuration
     config = AppConfig.from_env()
+    logger.debug(f"Loaded config from env: provider={config.llm.provider}, scraper={config.scraper.backend}")
 
     # Override scraper backend
     config.scraper.backend = args.scraper_backend
@@ -177,13 +192,13 @@ Environment Variables:
     if args.scraper_backend == "mcp":
         config.scraper.mcp.host = args.mcp_host
         config.scraper.mcp.port = int(args.mcp_port)
-        console.print(f"[dim]Using MCP scraper at {args.mcp_host}:{args.mcp_port}[/dim]")
+        logger.info(f"Using MCP scraper at {args.mcp_host}:{args.mcp_port}")
     else:
         # Firecrawl backend
         if args.firecrawl_api_key:
             config.firecrawl.api_key = args.firecrawl_api_key
             config.scraper.firecrawl.api_key = args.firecrawl_api_key
-        console.print("[dim]Using Firecrawl scraper[/dim]")
+        logger.info("Using Firecrawl scraper")
 
     # Override LLM settings with command line args
     if args.provider:
@@ -201,15 +216,19 @@ Environment Variables:
     if args.api_key:
         config.llm.api_key = args.api_key
 
+    logger.info(f"LLM: provider={config.llm.provider}, model={config.llm.model}")
+
     # Validate required keys based on backend
     if config.scraper.backend == "firecrawl" and not config.firecrawl.api_key:
         console.print("[red]Error: Firecrawl API key not provided[/red]")
         console.print("Set FIRECRAWL_API_KEY environment variable or use --firecrawl-api-key")
+        logger.error("Firecrawl API key not provided")
         sys.exit(1)
 
     if not config.llm.api_key and config.llm.provider != "local":
         console.print(f"[red]Error: LLM API key not provided for provider '{config.llm.provider}'[/red]")
         console.print(f"Set the appropriate environment variable or use --api-key")
+        logger.error(f"LLM API key not provided for provider '{config.llm.provider}'")
         sys.exit(1)
 
     # Run generation
@@ -226,6 +245,7 @@ Environment Variables:
 
             def progress_callback(stage, current, total, message):
                 nonlocal task_id
+                logger.debug(f"Progress: {stage} - {current}/{total} - {message}")
                 if stage == "mapping":
                     if task_id is None:
                         task_id = progress.add_task(message, total=total)
@@ -237,6 +257,7 @@ Environment Variables:
 
             import asyncio
 
+            logger.info(f"Starting generation for {args.url}")
             result = asyncio.run(
                 generate_llmstxt(
                     args.url,
@@ -252,8 +273,10 @@ Environment Variables:
         console.print()
         console.print(f"[green]Success![/green] Processed {result.num_urls_processed} out of {result.num_urls_total} URLs")
         console.print(f"Files saved to {args.output_dir}/")
+        logger.info(f"Generation complete: {result.num_urls_processed}/{result.num_urls_total} URLs processed")
 
     except Exception as e:
+        logger.exception(f"Generation failed: {e}")
         console.print(f"[red]Error: {e}[/red]")
         if args.verbose:
             console.print_exception()

@@ -10,20 +10,18 @@ Supports multiple scraping backends:
 """
 
 import re
-import logging
 import asyncio
 from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from loguru import logger
 from langchain_openai import ChatOpenAI
 
 from .config import AppConfig, LLMConfig
 from .firecrawl import FirecrawlClient, get_firecrawl_client
 from .mcp_scraper import MCPWebScraper, MCPConfig
 from .llm import create_llm, generate_summaries_batch
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass

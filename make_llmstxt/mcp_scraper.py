@@ -13,16 +13,14 @@ Configuration:
 
 import asyncio
 import json
-import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urljoin
 
+from loguru import logger
 import httpx
 from pydantic import BaseModel
-
-logger = logging.getLogger(__name__)
 
 # Configuration
 MCP_HOST = os.getenv("MCP_HOST", "100.85.22.99")

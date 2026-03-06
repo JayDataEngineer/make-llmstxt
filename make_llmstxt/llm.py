@@ -9,16 +9,14 @@ Supports:
 Uses LangChain's ChatOpenAI which works with any OpenAI-compatible API.
 """
 
-import logging
 from typing import Optional, Dict, Any, List
 
+from loguru import logger
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
 from .config import LLMConfig, PROVIDER_PROFILES
-
-logger = logging.getLogger(__name__)
 
 
 # Rate limit configurations per provider
