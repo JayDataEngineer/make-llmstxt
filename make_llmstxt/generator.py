@@ -7,6 +7,8 @@ Generates:
 Supports multiple scraping backends:
 - firecrawl: Use Firecrawl API (requires API key)
 - mcp: Use custom MCP server (via Tailscale)
+
+Includes Critic + Retry pattern for quality assurance.
 """
 
 import re
@@ -18,10 +20,11 @@ from pathlib import Path
 from loguru import logger
 from langchain_openai import ChatOpenAI
 
-from .config import AppConfig, LLMConfig
-from .firecrawl import FirecrawlClient, get_firecrawl_client
-from .mcp_scraper import MCPWebScraper, MCPConfig
+from .config import AppConfig
+from .firecrawl import FirecrawlClient
+from .mcp_scraper import MCPWebScraper
 from .llm import create_llm, generate_summaries_batch
+from .critic import Critic, CriticResult
 
 
 @dataclass
@@ -45,6 +48,11 @@ class GenerationResult:
     num_urls_processed: int
     num_urls_total: int
     pages: List[PageResult] = field(default_factory=list)
+    # Critic metadata
+    critic_passed: bool = True
+    critic_score: float = 1.0
+    critic_issues: List[str] = field(default_factory=list)
+    retry_count: int = 0
 
 
 # Type alias for scraper clients
@@ -78,55 +86,45 @@ class LLMsTxtGenerator:
         # Create LLM if not provided
         self.llm = llm or create_llm(config.llm)
 
+        # Create critic using same LLM
+        self.critic = Critic(self.llm)
+
         # Use provided scraper or create based on config
         if scraper is not None:
             self.scraper = scraper
         elif config.scraper.backend == "mcp":
             self.scraper = MCPWebScraper(config.scraper.mcp)
-            logger.info(f"[Generator] Using MCP scraper: {config.scraper.mcp.base_url}")
+            logger.info(f"Using MCP scraper at {config.scraper.mcp.base_url}")
         elif config.scraper.backend == "firecrawl":
-            self.scraper = FirecrawlClient(config.scraper.firecrawl)
-            logger.info(f"[Generator] Using Firecrawl scraper: {config.scraper.firecrawl.base_url}")
+            self.scraper = FirecrawlClient(config.firecrawl)
+            logger.info(f"Using Firecrawl scraper")
         else:
             raise ValueError(f"Unknown scraper backend: {config.scraper.backend}")
 
     async def map_website(self, url: str) -> List[str]:
-        """Map website to get all URLs.
-
-        Args:
-            url: Website URL
-
-        Returns:
-            List of URLs
-        """
+        """Map website to get all URLs."""
         if hasattr(self.scraper, 'map_website'):
             return await self.scraper.map_website(url, limit=self.config.max_urls)
         else:
-            # Fallback for scrapers without map support
-            logger.warning(f"[Generator] Scraper does not support mapping, returning single URL")
+            logger.warning("Scraper does not support mapping, returning single URL")
             return [url]
 
     async def scrape_url(self, url: str) -> Optional[Dict[str, Any]]:
-        """Scrape a single URL.
-
-        Args:
-            url: URL to scrape
-
-        Returns:
-            Scraped data or None
-        """
+        """Scrape a single URL."""
         return await self.scraper.scrape_url(url)
 
     async def process_batch(
         self,
         urls: List[str],
         start_index: int = 0,
+        feedback: Optional[List[str]] = None,
     ) -> List[PageResult]:
         """Process a batch of URLs.
 
         Args:
             urls: URLs to process
             start_index: Starting index for ordering
+            feedback: Optional critic feedback to improve summaries
 
         Returns:
             List of PageResult objects
@@ -150,7 +148,7 @@ class LLMsTxtGenerator:
             {"url": page["url"], "markdown": page["markdown"]}
             for page in scraped
         ]
-        summaries = await generate_summaries_batch(self.llm, pages_for_llm)
+        summaries = await generate_summaries_batch(self.llm, pages_for_llm, feedback=feedback)
 
         # Combine results
         results = []
@@ -173,6 +171,8 @@ class LLMsTxtGenerator:
         max_urls: Optional[int] = None,
         include_full_text: bool = True,
         progress_callback: Optional[callable] = None,
+        enable_critic: bool = True,
+        max_retries: int = 2,
     ) -> GenerationResult:
         """Generate llms.txt files for a website.
 
@@ -181,12 +181,81 @@ class LLMsTxtGenerator:
             max_urls: Override max URLs from config
             include_full_text: Whether to include full text
             progress_callback: Optional callback for progress updates
+            enable_critic: Whether to use critic validation
+            max_retries: Maximum retry attempts on critic failure
 
         Returns:
             GenerationResult with generated content
         """
         max_urls = max_urls or self.config.max_urls
+        previous_issues: List[str] = []
+        result: Optional[GenerationResult] = None
 
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                logger.warning(f"Retry attempt {attempt}/{max_retries} with {len(previous_issues)} issues to fix")
+
+            # Generate draft
+            result = await self._generate_draft(
+                url=url,
+                max_urls=max_urls,
+                include_full_text=include_full_text,
+                progress_callback=progress_callback,
+                feedback=previous_issues if attempt > 0 else None,
+            )
+
+            # Skip critic if disabled or first attempt
+            if not enable_critic:
+                return result
+
+            # Run critic
+            if progress_callback:
+                progress_callback("critiquing", 0, 1, "Validating output quality...")
+
+            critic_result = await self.critic.evaluate(
+                llmstxt=result.llmstxt,
+                llms_fulltxt=result.llms_fulltxt if include_full_text else None,
+                url=url,
+            )
+
+            # Update result with critic metadata
+            result.critic_passed = critic_result.passed
+            result.critic_score = critic_result.score
+            result.critic_issues = critic_result.issues
+            result.retry_count = attempt
+
+            if critic_result.passed:
+                logger.info(f"Critic passed with score {critic_result.score:.2f}")
+                return result
+
+            # Prepare feedback for next iteration
+            logger.warning(f"Critic failed (score {critic_result.score:.2f}): {critic_result.issues}")
+            previous_issues = critic_result.issues + critic_result.suggestions
+
+        # Max retries reached
+        logger.error(f"Max retries ({max_retries}) reached, returning best effort output")
+        return result
+
+    async def _generate_draft(
+        self,
+        url: str,
+        max_urls: int,
+        include_full_text: bool,
+        progress_callback: Optional[callable],
+        feedback: Optional[List[str]] = None,
+    ) -> GenerationResult:
+        """Internal method to generate a draft.
+
+        Args:
+            url: Website URL
+            max_urls: Maximum URLs to process
+            include_full_text: Whether to include full text
+            progress_callback: Progress callback
+            feedback: Optional critic feedback for retry
+
+        Returns:
+            GenerationResult
+        """
         # Step 1: Map website
         if progress_callback:
             progress_callback("mapping", 0, 1, f"Mapping {url}...")
@@ -216,17 +285,17 @@ class LLMsTxtGenerator:
                     f"Processing batch {batch_num}/{total_batches} ({len(batch)} URLs)",
                 )
 
-            results = await self.process_batch(batch, start_index=i)
+            results = await self.process_batch(batch, start_index=i, feedback=feedback)
             all_results.extend(results)
 
-            # Small delay between batches to avoid rate limiting
+            # Small delay between batches
             if i + batch_size < len(all_urls):
                 await asyncio.sleep(1)
 
         # Sort by index
         all_results.sort(key=lambda x: x.index)
 
-        # Step 3: Generate output files
+        # Step 3: Generate output
         if progress_callback:
             progress_callback("generating", 0, 1, "Generating output files...")
 
@@ -244,15 +313,7 @@ class LLMsTxtGenerator:
         )
 
     def _format_llmstxt(self, url: str, pages: List[PageResult]) -> str:
-        """Format llms.txt content.
-
-        Args:
-            url: Website URL
-            pages: List of page results
-
-        Returns:
-            Formatted llms.txt content
-        """
+        """Format llms.txt content."""
         lines = [f"# {url} llms.txt", ""]
 
         for page in pages:
@@ -261,15 +322,7 @@ class LLMsTxtGenerator:
         return "\n".join(lines) + "\n"
 
     def _format_llms_fulltxt(self, url: str, pages: List[PageResult]) -> str:
-        """Format llms-full.txt content.
-
-        Args:
-            url: Website URL
-            pages: List of page results
-
-        Returns:
-            Formatted llms-full.txt content
-        """
+        """Format llms-full.txt content."""
         lines = [f"# {url} llms-full.txt", ""]
 
         for i, page in enumerate(pages, 1):
@@ -281,11 +334,6 @@ class LLMsTxtGenerator:
             lines.append("")
 
         return "\n".join(lines)
-
-    @staticmethod
-    def remove_page_separators(text: str) -> str:
-        """Remove page separators from text."""
-        return re.sub(r"<\|page-\d+\|>\n", "", text)
 
     async def close(self) -> None:
         """Close the scraper connection."""
@@ -300,16 +348,20 @@ async def generate_llmstxt(
     include_full_text: bool = True,
     output_dir: Optional[Path] = None,
     progress_callback: Optional[callable] = None,
+    enable_critic: bool = True,
+    max_retries: int = 2,
 ) -> GenerationResult:
-    """Convenience function to generate llms.txt files.
+    """Generate llms.txt files for a website.
 
     Args:
         url: Website URL
-        config: Optional app configuration (loads from env if not provided)
+        config: Optional app configuration
         max_urls: Override max URLs
         include_full_text: Include full text file
-        output_dir: Directory to save files (if provided)
+        output_dir: Directory to save files
         progress_callback: Progress callback
+        enable_critic: Enable critic validation
+        max_retries: Max retry attempts
 
     Returns:
         GenerationResult
@@ -327,6 +379,8 @@ async def generate_llmstxt(
             max_urls=max_urls,
             include_full_text=include_full_text,
             progress_callback=progress_callback,
+            enable_critic=enable_critic,
+            max_retries=max_retries,
         )
 
         # Save files if output_dir provided

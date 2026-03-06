@@ -96,6 +96,7 @@ async def generate_summary(
     url: str,
     markdown: str,
     max_content_chars: int = 4000,
+    feedback: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     """Generate title and description for a page.
 
@@ -104,17 +105,30 @@ async def generate_summary(
         url: Page URL
         markdown: Page content in markdown
         max_content_chars: Max characters to send to LLM
+        feedback: Optional critic feedback to improve output
 
     Returns:
         Dict with 'title' and 'description' keys
     """
-    prompt = f"""Generate a 9-10 word description and a 3-4 word title for this webpage.
+    base_prompt = f"""Generate a 9-10 word description and a 3-4 word title for this webpage.
 The title and description should help users find this page for its intended purpose.
 
 URL: {url}
 
 Return ONLY valid JSON in this exact format:
 {{"title": "3-4 word title", "description": "9-10 word description"}}"""
+
+    # Add feedback if provided (for retry scenarios)
+    if feedback:
+        feedback_text = "\n".join(f"- {f}" for f in feedback)
+        prompt = f"""{base_prompt}
+
+CRITICAL - Previous attempt had these issues that MUST be fixed:
+{feedback_text}
+
+Ensure your output addresses these issues."""
+    else:
+        prompt = base_prompt
 
     messages = [
         SystemMessage(content="You are a helpful assistant that generates concise titles and descriptions for web pages. Always respond with valid JSON only."),
@@ -152,6 +166,7 @@ async def generate_summaries_batch(
     llm: ChatOpenAI,
     pages: List[Dict[str, str]],
     max_content_chars: int = 4000,
+    feedback: Optional[List[str]] = None,
 ) -> List[Dict[str, str]]:
     """Generate summaries for multiple pages.
 
@@ -159,18 +174,18 @@ async def generate_summaries_batch(
         llm: LangChain ChatOpenAI instance
         pages: List of dicts with 'url' and 'markdown' keys
         max_content_chars: Max chars per page
+        feedback: Optional critic feedback for retry
 
     Returns:
-        List of dicts with 'url', 'title', 'description' keys
+        List of dicts with 'title' and 'description' keys
     """
     import asyncio
 
     async def process_page(page: Dict[str, str]) -> Dict[str, str]:
         result = await generate_summary(
-            llm, page["url"], page["markdown"], max_content_chars
+            llm, page["url"], page["markdown"], max_content_chars, feedback=feedback
         )
         return {
-            "url": page["url"],
             "title": result["title"],
             "description": result["description"],
         }
