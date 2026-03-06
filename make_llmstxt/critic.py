@@ -12,6 +12,8 @@ from loguru import logger
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from .prompts import CRITIC_SYSTEM_PROMPT, build_critic_prompt
+
 
 class CriticResult(BaseModel):
     """Structured result from critic evaluation.
@@ -37,34 +39,6 @@ class CriticResult(BaseModel):
         default_factory=list,
         description="Actionable fixes for each issue. Must match issues count."
     )
-
-
-CRITIC_SYSTEM_PROMPT = """You are a strict quality critic for llms.txt files.
-
-Your job is to evaluate llms.txt drafts and provide actionable feedback.
-Be pedantic - the goal is machine-readable documentation for LLMs.
-
-VALIDATION RULES (ALL must pass):
-
-1. HEADER: Must start with `# <url> llms.txt` (exact format)
-2. ENTRIES: Each non-empty line after header must be:
-   `- [Title](URL): Description`
-3. TITLES: 2-5 words, specific, descriptive (NOT "Home", "Page", "About")
-4. DESCRIPTIONS: 8-15 words, summarize page purpose (NOT generic)
-5. NO PLACEHOLDERS: Reject "No description", "Page content", "This is a"
-6. NO DUPLICATES: Each URL appears exactly once
-7. VALID URLS: All URLs must be properly formatted
-
-SCORING:
-- 0.9+: Excellent, all rules passed, descriptions are specific
-- 0.7-0.8: Good, minor issues (e.g., one title slightly long)
-- 0.5-0.6: Acceptable, needs improvement but usable
-- <0.5: Fail, major issues (placeholders, missing header, etc.)
-
-Be harsh. Generic text like "This page contains information" is a FAILURE.
-Return passed=false if ANY entry has a placeholder or generic description.
-
-You MUST provide one suggestion per issue found."""
 
 
 class Critic:
@@ -108,33 +82,21 @@ class Critic:
         Returns:
             CriticResult with pass/fail and feedback
         """
-        content = f"""Evaluate this llms.txt output:
-
---- llms.txt ---
-{llmstxt}
---- end ---"""
-
-        if llms_fulltxt:
-            content += f"""
-
---- llms-full.txt (first 2000 chars) ---
-{llms_fulltxt[:2000]}
---- end ---"""
-
-        if url:
-            content = f"Source website: {url}\n\n{content}"
+        prompt = build_critic_prompt(llmstxt, llms_fulltxt, url)
 
         messages = [
             SystemMessage(content=CRITIC_SYSTEM_PROMPT),
-            HumanMessage(content=content),
+            HumanMessage(content=prompt),
         ]
 
         try:
             result = await self.llm.ainvoke(messages)
 
-            # Apply pass threshold
+            # Apply pass threshold override
             if result.score >= self.pass_threshold and not result.passed:
-                logger.info(f"Critic: Overriding passed=True (score {result.score:.2f} >= threshold {self.pass_threshold})")
+                logger.info(
+                    f"Critic: Overriding passed=True (score {result.score:.2f} >= threshold {self.pass_threshold})"
+                )
                 result = CriticResult(
                     passed=True,
                     score=result.score,
@@ -178,6 +140,7 @@ async def critique_generation(
     llmstxt: str,
     llms_fulltxt: Optional[str] = None,
     url: Optional[str] = None,
+    pass_threshold: float = 0.7,
 ) -> CriticResult:
     """Convenience function to critique generation output.
 
@@ -186,11 +149,12 @@ async def critique_generation(
         llmstxt: Generated llms.txt content
         llms_fulltxt: Optional llms-full.txt content
         url: Source URL for context
+        pass_threshold: Minimum score to pass
 
     Returns:
         CriticResult
     """
-    critic = Critic(llm)
+    critic = Critic(llm, pass_threshold=pass_threshold)
     return await critic.evaluate(llmstxt, llms_fulltxt, url)
 
 

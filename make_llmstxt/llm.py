@@ -10,13 +10,19 @@ Uses LangChain's ChatOpenAI which works with any OpenAI-compatible API.
 """
 
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 
 from loguru import logger
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
 from .config import LLMConfig, PROVIDER_PROFILES
+from .prompts import (
+    SUMMARY_SYSTEM_PROMPT,
+    SUMMARY_PROMPT_TEMPLATE,
+    SUMMARY_RETRY_PROMPT_TEMPLATE,
+)
 
 
 # Rate limit configurations per provider
@@ -110,50 +116,67 @@ async def generate_summary(
     Returns:
         Dict with 'title' and 'description' keys
     """
-    base_prompt = f"""Generate a 9-10 word description and a 3-4 word title for this webpage.
-The title and description should help users find this page for its intended purpose.
+    import json
 
-URL: {url}
+    content = markdown[:max_content_chars]
 
-Return ONLY valid JSON in this exact format:
-{{"title": "3-4 word title", "description": "9-10 word description"}}"""
-
-    # Add feedback if provided (for retry scenarios)
+    # Use retry prompt if feedback provided, otherwise use base prompt
     if feedback:
         feedback_text = "\n".join(f"- {f}" for f in feedback)
-        prompt = f"""{base_prompt}
-
-CRITICAL - Previous attempt had these issues that MUST be fixed:
-{feedback_text}
-
-Ensure your output addresses these issues."""
+        prompt = SUMMARY_RETRY_PROMPT_TEMPLATE.format(
+            url=url, content=content, feedback=feedback_text
+        )
     else:
-        prompt = base_prompt
+        prompt = SUMMARY_PROMPT_TEMPLATE.format(url=url, content=content)
 
     messages = [
-        SystemMessage(content="You are a helpful assistant that generates concise titles and descriptions for web pages. Always respond with valid JSON only."),
-        HumanMessage(content=f"{prompt}\n\nPage content:\n{markdown[:max_content_chars]}"),
+        SystemMessage(content=SUMMARY_SYSTEM_PROMPT),
+        HumanMessage(content=prompt),
     ]
 
     try:
         response = await llm.ainvoke(messages)
-        content = response.content.strip()
-
-        # Parse JSON response
-        import json
+        response_content = response.content.strip()
 
         # Try to extract JSON from response
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
+        if "```json" in response_content:
+            response_content = response_content.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_content:
+            response_content = response_content.split("```")[1].split("```")[0].strip()
 
-        result = json.loads(content)
+        result = json.loads(response_content)
+
+        # Validate output quality
+        title = result.get("title", "").strip()
+        description = result.get("description", "").strip()
+
+        # Reject generic/placeholder titles
+        generic_titles = {"page", "home", "about", "about us", "welcome", "untitled"}
+        if not title or title.lower() in generic_titles:
+            # Try to extract from URL as fallback
+            from urllib.parse import urlparse
+            path = urlparse(url).path.strip("/")
+            if path and "/" in path:
+                title = path.split("/")[-1].replace("-", " ").title()
+            else:
+                title = urlparse(url).netloc.split(".")[0].title()
+
+        # Reject generic/placeholder descriptions
+        generic_starters = ("this is", "this page", "page contains", "information about", "no description")
+        if not description or any(description.lower().startswith(s) for s in generic_starters):
+            description = f"Content from {urlparse(url).netloc}"
+
         return {
-            "title": result.get("title", "Page"),
-            "description": result.get("description", "No description available"),
+            "title": title,
+            "description": description,
         }
 
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error for {url}: {e}")
+        return {
+            "title": urlparse(url).path.split("/")[-1].replace("-", " ").title() or "Page",
+            "description": f"Content from {urlparse(url).netloc}",
+        }
     except Exception as e:
         logger.error(f"Error generating description for {url}: {e}")
         return {

@@ -48,6 +48,9 @@ class GenerationResult:
     num_urls_processed: int
     num_urls_total: int
     pages: List[PageResult] = field(default_factory=list)
+    # Project metadata
+    project_name: str = ""
+    project_summary: str = ""
     # Critic metadata
     critic_passed: bool = True
     critic_score: float = 1.0
@@ -323,17 +326,111 @@ class LLMsTxtGenerator:
         )
 
     def _format_llmstxt(self, url: str, pages: List[PageResult]) -> str:
-        """Format llms.txt content."""
-        lines = [f"# {url} llms.txt", ""]
+        """Format llms.txt content following the official spec.
+
+        Format:
+        # Project Name
+        > Summary of the project
+
+        ## Section
+        - [Title](URL): Description
+
+        ## Optional
+        - [Blog](URL): Description
+        """
+        from urllib.parse import urlparse
+
+        # Extract project name from URL
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace("www.", "")
+        # Convert domain to project name (e.g., "docs.python.org" -> "Python")
+        parts = domain.split(".")
+        if len(parts) >= 2:
+            project_name = parts[-2].capitalize() if parts[-2] not in ("www", "docs", "api") else parts[0].capitalize()
+        else:
+            project_name = parts[0].capitalize()
+
+        # Generate summary from first page content
+        summary = f"Documentation and resources for {project_name}."
+        if pages and pages[0].markdown:
+            # Extract first meaningful sentence
+            first_para = pages[0].markdown.split("\n\n")[0][:200]
+            if first_para:
+                summary = first_para.strip()
+
+        # Group pages into sections
+        core_pages = []
+        api_pages = []
+        guide_pages = []
+        optional_pages = []
+
+        optional_keywords = ("blog", "news", "changelog", "release", "announcement",
+                            "twitter", "facebook", "linkedin", "social", "community",
+                            "sponsor", "donate", "careers", "jobs", "press")
 
         for page in pages:
-            lines.append(f"- [{page.title}]({page.url}): {page.description}")
+            url_lower = page.url.lower()
+            title_lower = page.title.lower()
 
-        return "\n".join(lines) + "\n"
+            # Check if optional
+            is_optional = any(kw in url_lower or kw in title_lower for kw in optional_keywords)
+
+            if is_optional:
+                optional_pages.append(page)
+            elif any(kw in url_lower for kw in ("api", "reference", "function", "class")):
+                api_pages.append(page)
+            elif any(kw in url_lower for kw in ("guide", "tutorial", "learn", "getting", "start", "intro")):
+                guide_pages.append(page)
+            else:
+                core_pages.append(page)
+
+        # Build output
+        lines = [
+            f"# {project_name}",
+            f"> {summary}",
+            "",
+        ]
+
+        # Core section
+        if core_pages:
+            lines.append("## Core")
+            for page in core_pages:
+                lines.append(f"- [{page.title}]({page.url}): {page.description}")
+            lines.append("")
+
+        # Guide section
+        if guide_pages:
+            lines.append("## Guides")
+            for page in guide_pages:
+                lines.append(f"- [{page.title}]({page.url}): {page.description}")
+            lines.append("")
+
+        # API section
+        if api_pages:
+            lines.append("## API Reference")
+            for page in api_pages:
+                lines.append(f"- [{page.title}]({page.url}): {page.description}")
+            lines.append("")
+
+        # Optional section
+        if optional_pages:
+            lines.append("## Optional")
+            for page in optional_pages:
+                lines.append(f"- [{page.title}]({page.url}): {page.description}")
+            lines.append("")
+
+        return "\n".join(lines).strip() + "\n"
 
     def _format_llms_fulltxt(self, url: str, pages: List[PageResult]) -> str:
         """Format llms-full.txt content."""
-        lines = [f"# {url} llms-full.txt", ""]
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace("www.", "")
+        parts = domain.split(".")
+        project_name = parts[-2].capitalize() if len(parts) >= 2 and parts[-2] not in ("www", "docs", "api") else parts[0].capitalize()
+
+        lines = [f"# {project_name} llms-full.txt", ""]
 
         for i, page in enumerate(pages, 1):
             lines.append(f"<|page-{i}|>")
