@@ -1,6 +1,6 @@
 # Make LLMs.txt
 
-Generate `llms.txt` and `llms-full.txt` files for any website using Firecrawl and LangChain.
+Generate `llms.txt` and `llms-full.txt` files for any website using MCP scraper and LangChain.
 
 Supports multiple LLM providers: OpenAI, Anthropic, DeepSeek, OpenRouter, local servers, and more.
 
@@ -34,8 +34,8 @@ cp .env.example .env
 2. Edit `.env` and add your API keys:
 
 ```bash
-FIRECRAWL_API_KEY=fc-xxx
 OPENAI_API_KEY=sk-xxx
+MCP_HOST=100.85.22.99  # Your MCP server host
 ```
 
 3. Run the generator:
@@ -97,7 +97,8 @@ make-llmstxt --list-providers
 | `DEEPSEEK_API_KEY` | DeepSeek API key |
 | `OPENROUTER_API_KEY` | OpenRouter API key |
 | `ZAI_API_KEY` | ZAI/GLM API key |
-| `FIRECRAWL_API_KEY` | Firecrawl API key |
+| `MCP_HOST` | MCP server host (default: 100.85.22.99) |
+| `MCP_PORT` | MCP server port (default: 8000) |
 
 ## Python API
 
@@ -143,20 +144,28 @@ result = await generate_llmstxt(
 ### llms.txt
 
 ```
-# https://example.com llms.txt
+# Example
+> A sample website demonstrating the llms.txt format.
 
-- [Home](https://example.com/): Welcome page with main navigation
+## Core
+- [Getting Started](https://example.com/): Welcome page with main navigation
 - [About Us](https://example.com/about): Company history and team
 - [Products](https://example.com/products): Product catalog and pricing
+
+## API Reference
+- [API Docs](https://example.com/api): REST API documentation
+
+## Optional
+- [Blog](https://example.com/blog): Company news and updates
 ```
 
 ### llms-full.txt
 
 ```
-# https://example.com llms-full.txt
+# Example llms-full.txt
 
 <|page-1|>
-## Home
+## Getting Started
 URL: https://example.com/
 
 Full markdown content of the page...

@@ -24,11 +24,9 @@ def list_providers():
 
     for name, profile in PROVIDER_PROFILES.items():
         console.print(f"  [cyan]{name}[/cyan]")
-        console.print(f"    Default model: {profile.default_model}")
-        console.print(f"    Env key: {profile.env_key}")
-        if profile.base_url:
-            console.print(f"    Base URL: {profile.base_url}")
-        console.print(f"    {profile.description}")
+        console.print(f"    Default model: {profile['default_model']}")
+        console.print(f"    Env key: {profile['env_key']}")
+        console.print(f"    {profile['description']}")
         console.print()
 
     console.print("[dim]Set provider via LLM_PROVIDER env var or --provider flag[/dim]")
@@ -65,7 +63,9 @@ Environment Variables:
   DEEPSEEK_API_KEY   DeepSeek API key
   OPENROUTER_API_KEY OpenRouter API key
   ZAI_API_KEY        ZAI API key
-  FIRECRAWL_API_KEY  Firecrawl API key
+
+  MCP_HOST           MCP server host (default: 100.85.22.99)
+  MCP_PORT           MCP server port (default: 8000)
 
   LOG_LEVEL          Log level (DEBUG, INFO, WARNING, ERROR)
   LOG_FILE           Path to log file (optional)
@@ -109,13 +109,6 @@ Environment Variables:
         help="API key for LLM provider",
     )
     parser.add_argument(
-        "--scraper-backend",
-        "-s",
-        choices=["firecrawl", "mcp"],
-        default="mcp",
-        help="Scraper backend to use (default: mcp)",
-    )
-    parser.add_argument(
         "--mcp-host",
         default="100.85.22.99",
         help="MCP server host (default: 100.85.22.99 - Tailscale)",
@@ -124,10 +117,6 @@ Environment Variables:
         "--mcp-port",
         default="8000",
         help="MCP server port (default: 8000)",
-    )
-    parser.add_argument(
-        "--firecrawl-api-key",
-        help="Firecrawl API key (required if using firecrawl backend)",
     )
     parser.add_argument(
         "--no-full-text",
@@ -206,31 +195,19 @@ Environment Variables:
 
     # Build configuration
     config = AppConfig.from_env()
-    logger.debug(f"Loaded config from env: provider={config.llm.provider}, scraper={config.scraper.backend}")
+    logger.debug(f"Loaded config from env: provider={config.llm.provider}")
 
-    # Override scraper backend
-    config.scraper.backend = args.scraper_backend
-
-    # Configure MCP scraper if using mcp backend
-    if args.scraper_backend == "mcp":
-        config.scraper.mcp.host = args.mcp_host
-        config.scraper.mcp.port = int(args.mcp_port)
-        logger.info(f"Using MCP scraper at {args.mcp_host}:{args.mcp_port}")
-    else:
-        # Firecrawl backend
-        if args.firecrawl_api_key:
-            config.firecrawl.api_key = args.firecrawl_api_key
-            config.scraper.firecrawl.api_key = args.firecrawl_api_key
-        logger.info("Using Firecrawl scraper")
+    # Configure MCP scraper
+    config.mcp.host = args.mcp_host
+    config.mcp.port = int(args.mcp_port)
+    logger.info(f"Using MCP scraper at {args.mcp_host}:{args.mcp_port}")
 
     # Override LLM settings with command line args
     if args.provider:
         config.llm.provider = args.provider
         if args.provider in PROVIDER_PROFILES:
             profile = PROVIDER_PROFILES[args.provider]
-            config.llm.model = args.model or profile.default_model
-            if profile.base_url and not config.llm.base_url:
-                config.llm.base_url = profile.base_url
+            config.llm.model = args.model or profile["default_model"]
 
     if args.model:
         config.llm.model = args.model
@@ -240,13 +217,6 @@ Environment Variables:
         config.llm.api_key = args.api_key
 
     logger.info(f"LLM: provider={config.llm.provider}, model={config.llm.model}")
-
-    # Validate required keys based on backend
-    if config.scraper.backend == "firecrawl" and not config.firecrawl.api_key:
-        console.print("[red]Error: Firecrawl API key not provided[/red]")
-        console.print("Set FIRECRAWL_API_KEY environment variable or use --firecrawl-api-key")
-        logger.error("Firecrawl API key not provided")
-        sys.exit(1)
 
     if not config.llm.api_key and config.llm.provider != "local":
         console.print(f"[red]Error: LLM API key not provided for provider '{config.llm.provider}'[/red]")

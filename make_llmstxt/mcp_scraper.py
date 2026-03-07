@@ -1,10 +1,11 @@
-"""MCP Web Scraper - Replaces Firecrawl with custom MCP server.
+"""MCP Web Scraper - Connects to MCP research server for web scraping.
 
-Uses the MCP SSE protocol to connect to your custom web scraping server.
+Uses the MCP SSE protocol to connect to your MCP research server.
 Tools available:
-- web_search: Search the web
-- web_fetch: Fetch URL content
-- web_scrape: Scrape URL content (returns markdown)
+- search_web: Search the web
+- scrape_url: Scrape URL content (returns markdown)
+- docs_list_sources: List llms.txt sources
+- docs_fetch_docs: Fetch docs from llms.txt source
 
 Configuration:
 - MCP_HOST: MCP server host (default: 100.85.22.99 - Tailscale)
@@ -85,32 +86,41 @@ class MCPClient:
             self._sse_response = await self._sse_cm.__aenter__()
             self._sse_response.raise_for_status()
 
-            # Read initial events to get session ID
-            event_type = None
-            async for line in self._sse_response.aiter_lines():
-                line = line.strip()
-                if not line:
-                    continue
+            # Start background SSE processor (handles both init and events)
+            self._running = True
+            self._connected = asyncio.Event()
+            self._sse_task = asyncio.create_task(self._process_sse_events())
 
-                if line.startswith("event:"):
-                    event_type = line[6:].strip()
-                elif line.startswith("data:"):
-                    data = line[5:].strip()
-                    if event_type == "endpoint":
-                        self.message_endpoint = data
-                        if "session_id=" in data:
-                            self.session_id = data.split("session_id=")[1].split("&")[0]
-                        logger.info(f"[MCP] Session: {self.session_id}")
-                        break
-
-            if not self.session_id:
-                logger.warning("[MCP] No session ID received")
+            # Wait for connection to be established (session received)
+            try:
+                await asyncio.wait_for(self._connected.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[MCP] Timeout waiting for session")
+                self._running = False
                 await self._sse_cm.__aexit__(None, None, None)
                 return False
 
-            # Start background SSE processor
-            self._running = True
-            self._sse_task = asyncio.create_task(self._process_sse_events())
+            if not self.session_id:
+                logger.warning("[MCP] No session ID received")
+                self._running = False
+                await self._sse_cm.__aexit__(None, None, None)
+                return False
+
+            # MCP initialization handshake
+            logger.debug("[MCP] Sending initialize request...")
+            init_result = await self._call_jsonrpc("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "make-llmstxt",
+                    "version": "0.1.0"
+                }
+            })
+            logger.debug(f"[MCP] Initialize result: {init_result}")
+
+            # Send initialized notification
+            await self._send_notification("notifications/initialized")
+            logger.debug("[MCP] Sent initialized notification")
 
             logger.info(f"[MCP] Connected: {self.session_id}")
             return True
@@ -119,8 +129,27 @@ class MCPClient:
             logger.error(f"[MCP] Connection failed: {e}")
             return False
 
+    async def _send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Send a JSON-RPC notification (no response expected)."""
+        if not self.message_endpoint:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        client = await self._ensure_http_client()
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or {}
+        }
+
+        url = f"{self.base_url}{self.message_endpoint}"
+        logger.debug(f"[MCP] POST notification {method}")
+
+        response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        response.raise_for_status()
+
     async def _process_sse_events(self):
-        """Process SSE events for tool results."""
+        """Process SSE events - handles both initial connection and subsequent messages."""
         try:
             event_type = None
             async for line in self._sse_response.aiter_lines():
@@ -136,10 +165,21 @@ class MCPClient:
                 elif line.startswith("data:"):
                     data_str = line[5:].strip()
 
+                    # Handle initial endpoint event for session
+                    if event_type == "endpoint":
+                        self.message_endpoint = data_str
+                        if "session_id=" in data_str:
+                            self.session_id = data_str.split("session_id=")[1].split("&")[0]
+                        logger.info(f"[MCP] Session: {self.session_id}")
+                        self._connected.set()  # Signal that we're connected
+                        continue
+
+                    # Handle message events (tool results)
                     if event_type == "message":
                         try:
                             data = json.loads(data_str)
                             request_id = data.get("id")
+                            logger.debug(f"[MCP] SSE message id={request_id}: {str(data)[:200]}")
 
                             if request_id is not None and request_id in self._pending_requests:
                                 future = self._pending_requests.pop(request_id)
@@ -297,14 +337,32 @@ class MCPWebScraper:
         """
         try:
             client = await self._get_client()
-            result = await client.call_tool("web_scrape", {"url": url})
+            result = await client.call_tool("scrape_url", {"url": url})
 
+            # MCP server returns JSON string with scrape result
             if isinstance(result, str):
-                return {
-                    "url": url,
-                    "markdown": result,
-                    "metadata": {},
-                }
+                try:
+                    data = json.loads(result)
+                    if data.get("success"):
+                        return {
+                            "url": data.get("url", url),
+                            "markdown": data.get("content", ""),
+                            "metadata": {
+                                "title": data.get("title"),
+                                "word_count": data.get("word_count"),
+                                "method": data.get("method_used"),
+                            },
+                        }
+                    else:
+                        logger.warning(f"[MCP] Scrape failed for {url}: {data.get('error', 'Unknown error')}")
+                        return None
+                except json.JSONDecodeError:
+                    # Fallback: treat as raw markdown
+                    return {
+                        "url": url,
+                        "markdown": result,
+                        "metadata": {},
+                    }
             elif isinstance(result, dict):
                 return {
                     "url": url,
@@ -399,7 +457,7 @@ class MCPWebScraper:
             client = await self._get_client()
 
             # Try to fetch sitemap
-            result = await client.call_tool("web_fetch", {"url": sitemap_url})
+            result = await client.call_tool("scrape_url", {"url": sitemap_url})
 
             if isinstance(result, str) and "<urlset" in result:
                 # Parse XML sitemap

@@ -1,9 +1,10 @@
 """Critic module for llms.txt validation.
 
-Validates generated llms.txt output using structured LLM calls.
-Returns pass/fail with specific, actionable feedback for retries.
+Validates generated llms.txt output using the "Draft then Extract" pattern:
+1. LLM runs freely to evaluate the output (returns natural language)
+2. Extraction LLM with with_structured_output() parses into CriticResult
 
-Uses LangChain's with_structured_output for guaranteed JSON schema compliance.
+This works with any provider - even those that don't support native structured output.
 """
 
 from typing import List, Optional
@@ -16,11 +17,7 @@ from .prompts import CRITIC_SYSTEM_PROMPT, build_critic_prompt
 
 
 class CriticResult(BaseModel):
-    """Structured result from critic evaluation.
-
-    This schema is enforced via with_structured_output() to guarantee
-    the LLM always returns parseable JSON - no prompt engineering needed.
-    """
+    """Structured result from critic evaluation."""
 
     passed: bool = Field(
         description="True ONLY if output meets ALL validation rules. Be strict."
@@ -41,11 +38,27 @@ class CriticResult(BaseModel):
     )
 
 
+# Extraction prompt for parsing critic evaluation into structured output
+EXTRACTION_PROMPT = """Extract the evaluation results from the text below into structured JSON.
+
+The output must match this schema:
+- passed (boolean): True if the llms.txt passed validation
+- score (float 0.0-1.0): Quality score
+- issues (list of strings): Problems found
+- suggestions (list of strings): Fixes for the issues
+
+TEXT TO PARSE:
+{text}
+
+Return ONLY valid JSON matching the schema. No markdown, no explanation."""
+
+
 class Critic:
     """LLM-based critic for llms.txt validation.
 
-    Uses with_structured_output to guarantee valid JSON responses.
-    No need for prompt engineering around output parsing.
+    Uses "Draft then Extract" pattern:
+    1. LLM evaluates freely → natural language response
+    2. Extraction LLM parses response → CriticResult
     """
 
     def __init__(
@@ -61,10 +74,12 @@ class Critic:
             pass_threshold: Minimum score to pass (default 0.7)
             fail_on_error: If True, critic errors cause failure; else pass with warning
         """
-        # Use with_structured_output for guaranteed schema compliance
-        self.llm = llm.with_structured_output(CriticResult)
+        self.llm = llm
         self.pass_threshold = pass_threshold
         self.fail_on_error = fail_on_error
+
+        # Create extraction LLM with structured output
+        self.extraction_llm = llm.with_structured_output(CriticResult)
 
     async def evaluate(
         self,
@@ -90,7 +105,32 @@ class Critic:
         ]
 
         try:
-            result = await self.llm.ainvoke(messages)
+            # Step 1: Get free-form evaluation from LLM
+            logger.debug("[Critic] Getting free-form evaluation...")
+            response = await self.llm.ainvoke(messages)
+            evaluation_text = response.content if hasattr(response, 'content') else str(response)
+            logger.debug(f"[Critic] Evaluation text ({len(evaluation_text)} chars): {evaluation_text[:200]}...")
+
+            # Step 2: Extract structured result using with_structured_output
+            logger.debug("[Critic] Extracting structured result...")
+            extraction_messages = [HumanMessage(content=EXTRACTION_PROMPT.format(text=evaluation_text))]
+            result = await self.extraction_llm.ainvoke(extraction_messages)
+
+            # Handle case where LLM returns markdown-wrapped JSON instead of raw JSON
+            # (common with providers that don't fully support structured output)
+            if isinstance(result, str):
+                import json
+                import re
+                # Strip markdown code blocks if present
+                text = result.strip()
+                if text.startswith("```"):
+                    # Extract JSON from markdown code block
+                    match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
+                    if match:
+                        text = match.group(1).strip()
+                # Parse and re-validate
+                data = json.loads(text)
+                result = CriticResult(**data)
 
             # Apply pass threshold override
             if result.score >= self.pass_threshold and not result.passed:

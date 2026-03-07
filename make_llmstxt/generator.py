@@ -4,16 +4,13 @@ Generates:
 - llms.txt: Index of pages with titles and descriptions
 - llms-full.txt: Full content of all pages
 
-Supports multiple scraping backends:
-- firecrawl: Use Firecrawl API (requires API key)
-- mcp: Use custom MCP server (via Tailscale)
-
+Scraping via custom MCP server.
 Includes Critic + Retry pattern for quality assurance.
 """
 
 import re
 import asyncio
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,7 +18,6 @@ from loguru import logger
 from langchain_openai import ChatOpenAI
 
 from .config import AppConfig
-from .firecrawl import FirecrawlClient
 from .mcp_scraper import MCPWebScraper
 from .llm import create_llm, generate_summaries_batch
 from .critic import Critic, CriticResult
@@ -58,23 +54,17 @@ class GenerationResult:
     retry_count: int = 0
 
 
-# Type alias for scraper clients
-ScraperClient = Union[FirecrawlClient, MCPWebScraper]
-
-
 class LLMsTxtGenerator:
     """Generate llms.txt and llms-full.txt for websites.
 
-    Supports multiple scraping backends:
-    - firecrawl: Use Firecrawl API (requires API key)
-    - mcp: Use custom MCP server (via Tailscale)
+    Scraping via custom MCP server.
     """
 
     def __init__(
         self,
         config: AppConfig,
         llm: Optional[ChatOpenAI] = None,
-        scraper: Optional[ScraperClient] = None,
+        scraper: Optional[MCPWebScraper] = None,
         pass_threshold: float = 0.7,
         fail_on_critic_error: bool = False,
     ):
@@ -83,7 +73,7 @@ class LLMsTxtGenerator:
         Args:
             config: Application configuration
             llm: Optional pre-configured LLM instance
-            scraper: Optional pre-configured scraper client
+            scraper: Optional pre-configured MCP scraper
             pass_threshold: Minimum critic score to pass (0.0-1.0)
             fail_on_critic_error: Fail generation if critic errors
         """
@@ -95,24 +85,19 @@ class LLMsTxtGenerator:
         # Create LLM if not provided
         self.llm = llm or create_llm(config.llm)
 
-        # Create critic using same LLM with configurable thresholds
+        # Create critic
         self.critic = Critic(
             self.llm,
             pass_threshold=pass_threshold,
             fail_on_error=fail_on_critic_error,
         )
 
-        # Use provided scraper or create based on config
+        # Use provided scraper or create from config
         if scraper is not None:
             self.scraper = scraper
-        elif config.scraper.backend == "mcp":
-            self.scraper = MCPWebScraper(config.scraper.mcp)
-            logger.info(f"Using MCP scraper at {config.scraper.mcp.base_url}")
-        elif config.scraper.backend == "firecrawl":
-            self.scraper = FirecrawlClient(config.firecrawl)
-            logger.info(f"Using Firecrawl scraper")
         else:
-            raise ValueError(f"Unknown scraper backend: {config.scraper.backend}")
+            self.scraper = MCPWebScraper(config.mcp)
+            logger.info(f"Using MCP scraper at {config.mcp.base_url}")
 
     async def map_website(self, url: str) -> List[str]:
         """Map website to get all URLs."""
@@ -350,13 +335,17 @@ class LLMsTxtGenerator:
         else:
             project_name = parts[0].capitalize()
 
-        # Generate summary from first page content
+        # Generate summary - use first page description or fallback
         summary = f"Documentation and resources for {project_name}."
-        if pages and pages[0].markdown:
-            # Extract first meaningful sentence
-            first_para = pages[0].markdown.split("\n\n")[0][:200]
-            if first_para:
-                summary = first_para.strip()
+        if pages and pages[0].description:
+            # Use the generated description as summary
+            summary = pages[0].description
+        elif pages and pages[0].markdown:
+            # Try to extract first meaningful sentence (skip if it looks like form data)
+            first_para = pages[0].markdown.split("\n\n")[0][:200].strip()
+            # Skip if it looks like form fields or raw data
+            if first_para and not any(kw in first_para.lower() for kw in ["customer name", "telephone", "email address", "submit", ": \n"]):
+                summary = first_para
 
         # Group pages into sections
         core_pages = []

@@ -1,7 +1,7 @@
 [project]
 name = "make-llmstxt"
 version = "0.1.0"
-description = "Generate llms.txt and llms-full.txt files for any website using Firecrawl and LangChain"
+description = "Generate llms.txt and llms-full.txt files for any website using MCP scraper and LangChain"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
