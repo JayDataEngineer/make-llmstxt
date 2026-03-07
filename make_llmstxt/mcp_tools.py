@@ -1,15 +1,18 @@
 """Shared MCP tools module for both llms.txt and skill generators.
 
 Provides:
-- get_mcp_tools(): Context manager for loading MCP tools as LangChain tools
-- Direct async functions for programmatic use (map_domain, crawl_site, scrape_url)
+- Tool name constants for filtering
+- Wrapper functions using MCPWebScraper for direct programmatic use
+- LangChain tool creation for use with deep agents
 """
 
 from typing import List, Dict, Any, Optional, Set
 from contextlib import asynccontextmanager
 
 from loguru import logger
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.tools import tool
+
+from .mcp_scraper import MCPWebScraper, MCPConfig
 
 
 # ==============================================================================
@@ -39,34 +42,95 @@ def filter_tools_by_name(tools: List, tool_names: Set[str]) -> List:
 
 
 # ==============================================================================
-# MCP Client Context Manager
+# LangChain Tool Creation (for deep agents)
 # ==============================================================================
 
-@asynccontextmanager
-async def get_mcp_client(host: str, port: int):
-    """Context manager to connect to MCP server.
+def create_mcp_tools(scraper: MCPWebScraper, max_urls: int = 100) -> List:
+    """Create LangChain tools wrapping MCP scraper methods.
 
-    Usage:
-        async with get_mcp_client(host, port) as client:
-            tools = await client.get_tools()
-            # or use direct functions below
+    Args:
+        scraper: MCPWebScraper instance
+        max_urls: Default max URLs for mapping operations
+
+    Returns:
+        List of LangChain tools
     """
-    mcp_url = f"http://{host}:{port}/sse"
+    import asyncio
 
-    client = MultiServerMCPClient({
-        "webtools": {
-            "transport": "sse",
-            "url": mcp_url,
-        }
-    })
+    tools = []
 
-    async with client:
-        logger.info(f"[MCP] Connected to {mcp_url}")
-        yield client
+    @tool
+    def map_domain(domain: str, pattern: str = "*") -> dict:
+        """Discover URLs from a domain using sitemaps or Common Crawl.
+
+        Use this to find all available URLs on a website before crawling.
+
+        Args:
+            domain: Domain to map (e.g., 'docs.python.org')
+            pattern: URL pattern filter (e.g., '*/api/*')
+
+        Returns:
+            Dict with 'urls' (list of discovered URLs) and 'total' count
+        """
+        urls = asyncio.run(scraper.map_domain(
+            domain,
+            max_urls=max_urls,
+            pattern=pattern,
+        ))
+        return {"urls": urls, "total": len(urls)}
+
+    tools.append(map_domain)
+
+    @tool
+    def crawl_site(url: str, max_depth: int = 2, max_pages: int = 50) -> dict:
+        """Deep crawl a site following links (BFS strategy).
+
+        Use this to crawl multiple pages from a documentation site.
+
+        Args:
+            url: Starting URL to crawl
+            max_depth: Maximum depth to crawl (1-5)
+            max_pages: Maximum pages to crawl (1-200)
+
+        Returns:
+            Dict with 'pages' (list of crawled pages with url, title, content)
+        """
+        pages = asyncio.run(scraper.crawl_site(
+            url,
+            max_depth=max_depth,
+            max_pages=min(max_pages, max_urls),
+        ))
+        return {"pages": pages, "total": len(pages)}
+
+    tools.append(crawl_site)
+
+    @tool
+    def scrape_url(url: str) -> dict:
+        """Scrape a single URL and return markdown content.
+
+        Args:
+            url: URL to scrape
+
+        Returns:
+            Dict with url, title, content, metadata
+        """
+        result = asyncio.run(scraper.scrape_url(url))
+        if result:
+            return {
+                "url": url,
+                "title": result.get("metadata", {}).get("title", ""),
+                "content": result.get("markdown", ""),
+                "metadata": result.get("metadata", {}),
+            }
+        return {"error": f"Failed to scrape {url}"}
+
+    tools.append(scrape_url)
+
+    return tools
 
 
 @asynccontextmanager
-async def get_mcp_tools(host: str, port: int):
+async def get_mcp_tools(host: str, port: int, max_urls: int = 100):
     """Context manager to connect to MCP server and get LangChain tools.
 
     Usage:
@@ -74,12 +138,16 @@ async def get_mcp_tools(host: str, port: int):
             main_tools = filter_tools_by_name(tools, MAIN_AGENT_TOOL_NAMES)
             subagent_tools = filter_tools_by_name(tools, SUBAGENT_TOOL_NAMES)
     """
-    async with get_mcp_client(host, port) as client:
-        tools = await client.get_tools()
-        # Filter to only scraper tools
+    config = MCPConfig(host=host, port=port)
+    scraper = MCPWebScraper(config)
+
+    try:
+        tools = create_mcp_tools(scraper, max_urls=max_urls)
         scraper_tools = filter_tools_by_name(tools, ALL_SCRAPER_TOOLS)
-        logger.info(f"[MCP] Loaded {len(scraper_tools)} tools: {[t.name for t in scraper_tools]}")
+        logger.info(f"[MCP] Created {len(scraper_tools)} tools: {[t.name for t in scraper_tools]}")
         yield scraper_tools
+    finally:
+        await scraper.close()
 
 
 # ==============================================================================
@@ -105,31 +173,18 @@ async def mcp_map_domain(
     Returns:
         List of discovered URLs
     """
-    async with get_mcp_client(host, port) as client:
-        tools = await client.get_tools()
-        map_tool = next((t for t in tools if t.name == "map_domain"), None)
-
-        if not map_tool:
-            raise RuntimeError("map_domain tool not found on MCP server")
-
-        result = await map_tool.ainvoke({
-            "domain": domain,
-            "max_urls": max_urls,
-            "pattern": pattern,
-        })
-
-        # Parse result - MCP tools return content as list of dicts
-        if isinstance(result, list) and len(result) > 0:
-            content = result[0]
-            if isinstance(content, dict) and "text" in content:
-                import json
-                data = json.loads(content["text"])
-                urls = data.get("urls", [])
-                logger.info(f"[MCP] map_domain found {len(urls)} URLs for {domain}")
-                return urls
-
-        logger.warning(f"[MCP] Unexpected map_domain result format")
-        return []
+    config = MCPConfig(host=host, port=port)
+    scraper = MCPWebScraper(config)
+    try:
+        urls = await scraper.map_domain(
+            domain,
+            max_urls=max_urls,
+            pattern=pattern,
+        )
+        logger.info(f"[MCP] map_domain found {len(urls)} URLs for {domain}")
+        return urls
+    finally:
+        await scraper.close()
 
 
 async def mcp_crawl_site(
@@ -155,37 +210,20 @@ async def mcp_crawl_site(
     Returns:
         List of crawled pages with content
     """
-    async with get_mcp_client(host, port) as client:
-        tools = await client.get_tools()
-        crawl_tool = next((t for t in tools if t.name == "crawl_site"), None)
-
-        if not crawl_tool:
-            raise RuntimeError("crawl_site tool not found on MCP server")
-
-        args = {
-            "url": url,
-            "max_depth": max_depth,
-            "max_pages": max_pages,
-        }
-        if include_patterns:
-            args["include_patterns"] = include_patterns
-        if exclude_patterns:
-            args["exclude_patterns"] = exclude_patterns
-
-        result = await crawl_tool.ainvoke(args)
-
-        # Parse result
-        if isinstance(result, list) and len(result) > 0:
-            content = result[0]
-            if isinstance(content, dict) and "text" in content:
-                import json
-                data = json.loads(content["text"])
-                pages = data.get("pages", [])
-                logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
-                return pages
-
-        logger.warning(f"[MCP] Unexpected crawl_site result format")
-        return []
+    config = MCPConfig(host=host, port=port)
+    scraper = MCPWebScraper(config)
+    try:
+        pages = await scraper.crawl_site(
+            url,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        )
+        logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
+        return pages
+    finally:
+        await scraper.close()
 
 
 async def mcp_scrape_url(
@@ -203,39 +241,21 @@ async def mcp_scrape_url(
     Returns:
         Dict with url, title, content, metadata or None on failure
     """
-    async with get_mcp_client(host, port) as client:
-        tools = await client.get_tools()
-        scrape_tool = next((t for t in tools if t.name == "scrape_url"), None)
-
-        if not scrape_tool:
-            raise RuntimeError("scrape_url tool not found on MCP server")
-
-        result = await scrape_tool.ainvoke({"url": url})
-
-        # Parse result
-        if isinstance(result, list) and len(result) > 0:
-            content = result[0]
-            if isinstance(content, dict) and "text" in content:
-                import json
-                data = json.loads(content["text"])
-                if data.get("success"):
-                    return {
-                        "url": data.get("url", url),
-                        "title": data.get("title", ""),
-                        "content": data.get("content", ""),
-                        "markdown": data.get("content", ""),
-                        "metadata": {
-                            "title": data.get("title"),
-                            "word_count": data.get("word_count"),
-                            "method": data.get("method_used"),
-                        },
-                    }
-                else:
-                    logger.warning(f"[MCP] Scrape failed for {url}: {data.get('error')}")
-                    return None
-
-        logger.warning(f"[MCP] Unexpected scrape_url result format")
+    config = MCPConfig(host=host, port=port)
+    scraper = MCPWebScraper(config)
+    try:
+        result = await scraper.scrape_url(url)
+        if result:
+            return {
+                "url": result.get("url", url),
+                "title": result.get("metadata", {}).get("title", ""),
+                "content": result.get("markdown", ""),
+                "markdown": result.get("markdown", ""),
+                "metadata": result.get("metadata", {}),
+            }
         return None
+    finally:
+        await scraper.close()
 
 
 async def mcp_scrape_batch(
@@ -253,15 +273,22 @@ async def mcp_scrape_batch(
     Returns:
         List of scraped pages (excludes failures)
     """
-    import asyncio
-
-    async def scrape_one(url: str) -> Optional[Dict[str, Any]]:
-        return await mcp_scrape_url(host, port, url)
-
-    tasks = [scrape_one(url) for url in urls]
-    results = await asyncio.gather(*tasks)
-
-    return [r for r in results if r is not None]
+    config = MCPConfig(host=host, port=port)
+    scraper = MCPWebScraper(config)
+    try:
+        pages = await scraper.scrape_batch(urls)
+        return [
+            {
+                "url": p.get("url", ""),
+                "title": p.get("metadata", {}).get("title", ""),
+                "content": p.get("markdown", ""),
+                "markdown": p.get("markdown", ""),
+                "metadata": p.get("metadata", {}),
+            }
+            for p in pages
+        ]
+    finally:
+        await scraper.close()
 
 
 async def mcp_map_website(
@@ -272,7 +299,7 @@ async def mcp_map_website(
 ) -> List[str]:
     """Map website to get URLs (compatibility function).
 
-    Uses map_domain under the hood for consistency.
+    Uses the existing MCPWebScraper.map_website method.
 
     Args:
         host: MCP server host
@@ -283,19 +310,14 @@ async def mcp_map_website(
     Returns:
         List of discovered URLs
     """
-    from urllib.parse import urlparse
-
-    parsed = urlparse(url)
-    domain = parsed.netloc
-
-    urls = await mcp_map_domain(
-        host=host,
-        port=port,
-        domain=domain,
-        max_urls=limit or 100,
-    )
-
-    return urls
+    config = MCPConfig(host=host, port=port)
+    scraper = MCPWebScraper(config)
+    try:
+        urls = await scraper.map_website(url, limit=limit)
+        logger.info(f"[MCP] map_website found {len(urls)} URLs for {url}")
+        return urls
+    finally:
+        await scraper.close()
 
 
 # ==============================================================================
@@ -309,8 +331,9 @@ __all__ = [
     "ALL_SCRAPER_TOOLS",
     # Utilities
     "filter_tools_by_name",
+    # Tool creation
+    "create_mcp_tools",
     # Context managers
-    "get_mcp_client",
     "get_mcp_tools",
     # Direct functions
     "mcp_map_domain",

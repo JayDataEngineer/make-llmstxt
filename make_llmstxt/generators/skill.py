@@ -143,7 +143,11 @@ class SkillGenerator:
             progress_callback("Connecting to MCP server...", 10)
 
         # Connect to MCP server and get tools
-        async with get_mcp_tools(self.config.mcp_host, self.config.mcp_port) as all_tools:
+        async with get_mcp_tools(
+            self.config.mcp_host,
+            self.config.mcp_port,
+            max_urls=self.config.max_urls,
+        ) as all_tools:
             # Filter tools for main agent and subagents
             main_tools = filter_tools_by_name(all_tools, MAIN_AGENT_TOOL_NAMES)
             subagent_tools = filter_tools_by_name(all_tools, SUBAGENT_TOOL_NAMES)
