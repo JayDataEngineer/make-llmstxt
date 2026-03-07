@@ -50,6 +50,7 @@ def handle_skill(args):
         output_dir=Path(args.output_dir),
         mcp_host=args.mcp_host,
         mcp_port=int(args.mcp_port),
+        max_rounds=args.max_rounds,
     )
 
     # Override LLM settings from env
@@ -188,6 +189,7 @@ def main():
     skill_parser.add_argument("--api-key", help="API key for LLM provider")
     skill_parser.add_argument("--mcp-host", default="100.85.22.99", help="MCP server host")
     skill_parser.add_argument("--mcp-port", default="8000", help="MCP server port")
+    skill_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum critic revision rounds (default: 3)")
     skill_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     skill_parser.add_argument("--log-file", help="Path to log file")
     skill_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")

@@ -289,16 +289,14 @@ class SkillGenerator:
             progress_callback("Running skill generation graph...", 40)
 
         # Step 4: Build the graph with max iterations guard
-        MAX_ITERATIONS = 3  # Prevent infinite loops
-
         def should_continue(state: MessagesState) -> str:
             """Router: Check if critic approved or needs fixes."""
             # Check iteration count to prevent infinite loops
             message_count = len(state.get("messages", []))
             iteration = message_count // 3  # Each iteration = supervisor + generator + critic
 
-            if iteration >= MAX_ITERATIONS:
-                logger.warning(f"[SkillGenerator] Max iterations ({MAX_ITERATIONS}) reached, ending")
+            if iteration >= self.config.max_rounds:
+                logger.warning(f"[SkillGenerator] Max iterations ({self.config.max_rounds}) reached, ending")
                 return END
 
             last_message = state["messages"][-1].content
