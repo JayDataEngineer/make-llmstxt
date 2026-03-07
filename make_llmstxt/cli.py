@@ -12,6 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from .config import AppConfig, LLMConfig, PROVIDER_PROFILES
 from .generator import generate_llmstxt
+from .generators.skill import SkillGenerator
 from .__init__ import __version__
 from .logging import setup_logging
 
