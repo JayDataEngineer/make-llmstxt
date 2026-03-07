@@ -45,12 +45,15 @@ def list_providers():
 def handle_skill(args):
     """Handle skill generation with hierarchical LangGraph."""
     # Setup config for skill generator
+    # Read max_rounds from env or use CLI default
+    max_rounds = args.max_rounds or int(os.getenv("SKILL_MAX_ROUNDS", "3"))
+
     skill_config = GeneratorConfig(
         url=args.url,
         output_dir=Path(args.output_dir),
         mcp_host=args.mcp_host,
         mcp_port=int(args.mcp_port),
-        max_rounds=args.max_rounds,
+        max_rounds=max_rounds,
     )
 
     # Override LLM settings from env
