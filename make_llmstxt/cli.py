@@ -1,4 +1,10 @@
-"""Command-line interface for make-llmstxt."""
+"""Command-line interface for make-llmstxt.
+
+Supports two modes:
+- llms.txt: Index of pages with titles and descriptions (default)
+- skill: Skill package with folder structure (SKILL.md, scripts/, references/)
+
+"""
 
 import argparse
 import os
@@ -9,12 +15,14 @@ from dotenv import load_dotenv
 from loguru import logger
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+import asyncio
 
 from .config import AppConfig, LLMConfig, PROVIDER_PROFILES
 from .generator import generate_llmstxt
 from .generators.skill import SkillGenerator
 from .__init__ import __version__
 from .logging import setup_logging
+from .core import GeneratorConfig
 
 console = Console()
 
@@ -34,132 +42,93 @@ def list_providers():
     console.print("[dim]Set API key via provider's env key (e.g., OPENAI_API_KEY)[/dim]")
 
 
+def handle_skill(args):
+    """Handle skill generation with hierarchical LangGraph."""
+    # Setup config for skill generator
+    skill_config = GeneratorConfig(
+        url=args.url,
+        output_dir=Path(args.output_dir),
+        mcp_host=args.mcp_host,
+        mcp_port=int(args.mcp_port),
+    )
+
+    # Override LLM settings from env
+    env_config = AppConfig.from_env()
+    skill_config.api_key = env_config.llm.api_key
+    skill_config.base_url = env_config.llm.base_url
+    skill_config.model = env_config.llm.model
+    skill_config.provider = env_config.llm.provider
+
+    # Override with CLI args
+    if args.provider:
+        skill_config.provider = args.provider
+        if args.provider in PROVIDER_PROFILES:
+            profile = PROVIDER_PROFILES[args.provider]
+            skill_config.model = args.model or profile["default_model"]
+    if args.model:
+        skill_config.model = args.model
+    if args.base_url:
+        skill_config.base_url = args.base_url
+    if args.api_key:
+        skill_config.api_key = args.api_key
+
+    # Create skill generator
+    generator = SkillGenerator(skill_config)
+
+    console.print(f"\n[bold cyan]Starting skill generation for {args.url}...[/bold cyan]")
+    console.print(f"Provider: {skill_config.provider}")
+    console.print(f"Model: {skill_config.model}")
+    console.print(f"MCP: {args.mcp_host}:{args.mcp_port}")
+    console.print()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("Initializing...", total=None)
+
+        def progress_callback(message: str, percent: int):
+            nonlocal task_id
+            progress.update(task_id, description=message)
+
+        try:
+            result = asyncio.run(
+                generator.generate(
+                    args.url,
+                    output_dir=Path(args.output_dir),
+                    progress_callback=progress_callback,
+                )
+            )
+
+            console.print()
+            console.print(f"[green]Success![/green] Skill package created")
+            console.print(f"Output: {result.output_path}")
+            console.print(f"Pages processed: {result.stats.get('pages_processed', 0)}")
+            console.print(f"Files created: {result.stats.get('files_created', 0)}")
+            logger.info(f"Skill package created at {result.output_path}")
+
+        except Exception as e:
+            logger.exception(f"Skill generation failed: {e}")
+            console.print(f"[red]Error: {e}[/red]")
+            if args.verbose:
+                console.print_exception()
+            sys.exit(1)
+
+        finally:
+            asyncio.run(generator.close())
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Generate llms.txt and llms-full.txt files for any website",
+        description="Generate llms.txt or skill packages for documentation websites",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic usage with OpenAI (default)
-  make-llmstxt https://example.com
-
-  # Use a different provider
-  make-llmstxt https://example.com --provider deepseek
-
-  # Use local server
-  make-llmstxt https://example.com --provider local --base-url http://localhost:8000/v1
-
-  # Limit URLs and output to specific directory
-  make-llmstxt https://example.com --max-urls 50 --output-dir ./output
-
-Environment Variables:
-  LLM_PROVIDER       Provider to use (openai, anthropic, deepseek, local, etc.)
-  LLM_MODEL          Model name to use
-  LLM_API_KEY        API key (if not using provider-specific env var)
-  LLM_BASE_URL       Base URL for API
-
-  OPENAI_API_KEY     OpenAI API key
-  ANTHROPIC_API_KEY  Anthropic API key
-  DEEPSEEK_API_KEY   DeepSeek API key
-  OPENROUTER_API_KEY OpenRouter API key
-  ZAI_API_KEY        ZAI API key
-
-  MCP_HOST           MCP server host (default: 100.85.22.99)
-  MCP_PORT           MCP server port (default: 8000)
-
-  LOG_LEVEL          Log level (DEBUG, INFO, WARNING, ERROR)
-  LOG_FILE           Path to log file (optional)
-  LOG_JSON           Use JSON log format (true/false)
-        """,
     )
 
-    parser.add_argument("url", nargs="?", help="Website URL to process")
+    # Global options
     parser.add_argument(
         "--version", "-v", action="version", version=f"make-llmstxt {__version__}"
-    )
-    parser.add_argument(
-        "--max-urls",
-        type=int,
-        default=None,
-        help="Maximum number of URLs to process (default: unlimited, process all URLs in sitemap)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        "-o",
-        default=".",
-        help="Directory to save output files (default: current directory)",
-    )
-    parser.add_argument(
-        "--provider",
-        "-p",
-        choices=list(PROVIDER_PROFILES.keys()),
-        help="LLM provider to use",
-    )
-    parser.add_argument(
-        "--model",
-        "-m",
-        help="Model name to use",
-    )
-    parser.add_argument(
-        "--base-url",
-        help="Base URL for LLM API (for custom providers)",
-    )
-    parser.add_argument(
-        "--api-key",
-        help="API key for LLM provider",
-    )
-    parser.add_argument(
-        "--mcp-host",
-        default="100.85.22.99",
-        help="MCP server host (default: 100.85.22.99 - Tailscale)",
-    )
-    parser.add_argument(
-        "--mcp-port",
-        default="8000",
-        help="MCP server port (default: 8000)",
-    )
-    parser.add_argument(
-        "--no-full-text",
-        action="store_true",
-        help="Don't generate llms-full.txt file",
-    )
-    # Deep Draft-Critic options
-    parser.add_argument(
-        "--no-critic",
-        action="store_true",
-        help="Disable critic validation (faster but lower quality)",
-    )
-    parser.add_argument(
-        "--max-rounds",
-        type=int,
-        default=3,
-        help="Maximum draft-critic rounds (default: 3)",
-    )
-    parser.add_argument(
-        "--pass-threshold",
-        type=float,
-        default=0.7,
-        help="Minimum score to pass critic, 0.0-1.0 (default: 0.7)",
-    )
-    parser.add_argument(
-        "--critic-strict",
-        action="store_true",
-        help="Fail generation if critic errors occur",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose (DEBUG) logging",
-    )
-    parser.add_argument(
-        "--log-file",
-        help="Path to log file",
-    )
-    parser.add_argument(
-        "--log-json",
-        action="store_true",
-        help="Use JSON log format",
     )
     parser.add_argument(
         "--list-providers",
@@ -167,22 +136,74 @@ Environment Variables:
         help="List available LLM providers",
     )
 
+    # Subparsers for different modes
+    subparsers = parser.add_subparsers(dest="mode", help="Generation mode")
+
+    # ========== llms.txt mode (default) ==========
+    llmstxt_parser = subparsers.add_parser(
+        "llmstxt",
+        help="Generate llms.txt and llms-full.txt (default mode)",
+    )
+    llmstxt_parser.add_argument("url", nargs="?", help="Website URL to process")
+    llmstxt_parser.add_argument(
+        "--max-urls",
+        type=int,
+        default=None,
+        help="Maximum number of URLs to process (default: unlimited)",
+    )
+    llmstxt_parser.add_argument(
+        "--output-dir", "-o",
+        default=".",
+        help="Directory to save output files (default: current directory)",
+    )
+    llmstxt_parser.add_argument(
+        "--provider", "-p",
+        choices=list(PROVIDER_PROFILES.keys()),
+        help="LLM provider to use",
+    )
+    llmstxt_parser.add_argument("--model", "-m", help="Model name to use")
+    llmstxt_parser.add_argument("--base-url", help="Base URL for LLM API")
+    llmstxt_parser.add_argument("--api-key", help="API key for LLM provider")
+    llmstxt_parser.add_argument("--mcp-host", default="100.85.22.99", help="MCP server host")
+    llmstxt_parser.add_argument("--mcp-port", default="8000", help="MCP server port")
+    llmstxt_parser.add_argument("--no-full-text", action="store_true", help="Don't generate llms-full.txt")
+    llmstxt_parser.add_argument("--no-critic", action="store_true", help="Disable critic validation")
+    llmstxt_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum draft-critic rounds")
+    llmstxt_parser.add_argument("--pass-threshold", type=float, default=0.7, help="Minimum score to pass critic")
+    llmstxt_parser.add_argument("--critic-strict", action="store_true", help="Fail if critic errors")
+    llmstxt_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    llmstxt_parser.add_argument("--log-file", help="Path to log file")
+    llmstxt_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")
+
+    # ========== skill mode ==========
+    skill_parser = subparsers.add_parser(
+        "skill",
+        help="Generate a skill package (SKILL.md, scripts/, references/) using hierarchical LangGraph",
+    )
+    skill_parser.add_argument("url", help="Library/framework documentation URL")
+    skill_parser.add_argument("--output-dir", "-o", default=".", help="Output directory for skill package")
+    skill_parser.add_argument("--provider", "-p", choices=list(PROVIDER_PROFILES.keys()), help="LLM provider")
+    skill_parser.add_argument("--model", "-m", help="Model name to use")
+    skill_parser.add_argument("--base-url", help="Base URL for LLM API")
+    skill_parser.add_argument("--api-key", help="API key for LLM provider")
+    skill_parser.add_argument("--mcp-host", default="100.85.22.99", help="MCP server host")
+    skill_parser.add_argument("--mcp-port", default="8000", help="MCP server port")
+    skill_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
+    skill_parser.add_argument("--log-file", help="Path to log file")
+    skill_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")
+
+    # Parse arguments
     args = parser.parse_args()
 
     # Load .env file
     load_dotenv()
 
-    # Setup logging with loguru
-    log_level = "DEBUG" if args.verbose else os.getenv("LOG_LEVEL", "INFO").upper()
-    log_file = Path(args.log_file) if args.log_file else (Path(os.getenv("LOG_FILE")) if os.getenv("LOG_FILE") else None)
-    log_json = args.log_json or os.getenv("LOG_JSON", "false").lower() == "true"
+    # Setup logging
+    log_level = "DEBUG" if getattr(args, 'verbose', False) else os.getenv("LOG_LEVEL", "INFO").upper()
+    log_file = Path(args.log_file) if hasattr(args, 'log_file') and args.log_file else None
+    log_json = hasattr(args, 'log_json') and args.log_json
 
-    setup_logging(
-        level=log_level,
-        log_file=log_file,
-        json_format=log_json,
-    )
-
+    setup_logging(level=log_level, log_file=log_file, json_format=log_json)
     logger.info(f"make-llmstxt v{__version__} starting up")
 
     # List providers if requested
@@ -190,9 +211,14 @@ Environment Variables:
         list_providers()
         return
 
-    # Validate URL
-    if not args.url:
-        parser.error("URL is required (or use --list-providers)")
+    # Handle skill mode
+    if args.mode == "skill":
+        handle_skill(args)
+        return
+
+    # Handle llms.txt mode (default)
+    if not hasattr(args, 'url') or not args.url:
+        parser.error("URL is required")
 
     # Build configuration
     config = AppConfig.from_env()
@@ -225,7 +251,7 @@ Environment Variables:
         logger.error(f"LLM API key not provided for provider '{config.llm.provider}'")
         sys.exit(1)
 
-    # Run generation
+    # Run llms.txt generation
     try:
         with Progress(
             SpinnerColumn(),
@@ -248,8 +274,6 @@ Environment Variables:
                     if task_id is None:
                         task_id = progress.add_task(message, total=total)
                     progress.update(task_id, description=message, completed=current)
-
-            import asyncio
 
             logger.info(f"Starting generation for {args.url}")
             result = asyncio.run(
