@@ -4,11 +4,10 @@ Generates:
 - llms.txt: Index of pages with titles and descriptions
 - llms-full.txt: Full content of all pages
 
-Scraping via custom MCP server.
+Scraping via MCP server using langchain-mcp-adapters.
 Uses Deep Agents Draft-Critic pattern for quality assurance.
 """
 
-import re
 import asyncio
 from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
@@ -18,7 +17,7 @@ from loguru import logger
 from langchain_openai import ChatOpenAI
 
 from .config import AppConfig
-from .mcp_scraper import MCPWebScraper
+from .mcp_tools import mcp_map_website, mcp_scrape_batch
 from .llm import create_llm, generate_summaries_batch
 from .critic import CriticResult
 from .deep_draft import (
@@ -62,7 +61,7 @@ class GenerationResult:
 class LLMsTxtGenerator:
     """Generate llms.txt and llms-full.txt for websites.
 
-    Scraping via custom MCP server.
+    Scraping via MCP server using langchain-mcp-adapters.
     Uses Deep Agents Draft-Critic pattern for iterative quality improvement.
     """
 
@@ -70,7 +69,6 @@ class LLMsTxtGenerator:
         self,
         config: AppConfig,
         llm: Optional[ChatOpenAI] = None,
-        scraper: Optional[MCPWebScraper] = None,
         pass_threshold: float = 0.7,
         fail_on_critic_error: bool = False,
         max_rounds: int = 3,
@@ -80,13 +78,11 @@ class LLMsTxtGenerator:
         Args:
             config: Application configuration
             llm: Optional pre-configured LLM instance
-            scraper: Optional pre-configured MCP scraper
             pass_threshold: Minimum critic score to pass (0.0-1.0)
             fail_on_critic_error: Fail generation if critic errors
             max_rounds: Maximum draft-critic rounds (default: 3)
         """
         self.config = config
-        self._external_scraper = scraper is not None
         self.pass_threshold = pass_threshold
         self.fail_on_critic_error = fail_on_critic_error
         self.max_rounds = max_rounds
@@ -102,24 +98,25 @@ class LLMsTxtGenerator:
             temperature=config.llm.temperature,
         )
 
-        # Use provided scraper or create from config
-        if scraper is not None:
-            self.scraper = scraper
-        else:
-            self.scraper = MCPWebScraper(config.mcp)
-            logger.info(f"Using MCP scraper at {config.mcp.base_url}")
+        logger.info(f"Using MCP server at {config.mcp.base_url}")
 
     async def map_website(self, url: str) -> List[str]:
         """Map website to get all URLs."""
-        if hasattr(self.scraper, 'map_website'):
-            return await self.scraper.map_website(url, limit=self.config.max_urls)
-        else:
-            logger.warning("Scraper does not support mapping, returning single URL")
-            return [url]
+        return await mcp_map_website(
+            host=self.config.mcp.host,
+            port=self.config.mcp.port,
+            url=url,
+            limit=self.config.max_urls,
+        )
 
     async def scrape_url(self, url: str) -> Optional[Dict[str, Any]]:
         """Scrape a single URL."""
-        return await self.scraper.scrape_url(url)
+        from .mcp_tools import mcp_scrape_url
+        return await mcp_scrape_url(
+            host=self.config.mcp.host,
+            port=self.config.mcp.port,
+            url=url,
+        )
 
     async def process_batch(
         self,
@@ -137,16 +134,12 @@ class LLMsTxtGenerator:
         Returns:
             List of PageResult objects
         """
-        # Scrape all URLs
-        if hasattr(self.scraper, 'scrape_batch'):
-            scraped = await self.scraper.scrape_batch(urls)
-        else:
-            # Fallback: scrape one by one
-            scraped = []
-            for url in urls:
-                result = await self.scrape_url(url)
-                if result:
-                    scraped.append(result)
+        # Scrape all URLs using shared MCP function
+        scraped = await mcp_scrape_batch(
+            host=self.config.mcp.host,
+            port=self.config.mcp.port,
+            urls=urls,
+        )
 
         if not scraped:
             return []
@@ -508,9 +501,8 @@ class LLMsTxtGenerator:
         return "\n".join(lines)
 
     async def close(self) -> None:
-        """Close the scraper connection."""
-        if hasattr(self.scraper, 'close'):
-            await self.scraper.close()
+        """Close any resources."""
+        pass  # MCP connections are managed per-call in mcp_tools
 
 
 async def generate_llmstxt(

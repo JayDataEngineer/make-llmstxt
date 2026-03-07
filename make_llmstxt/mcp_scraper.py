@@ -398,6 +398,110 @@ class MCPWebScraper:
 
         return [r for r in results if r is not None]
 
+    async def map_domain(
+        self,
+        domain: str,
+        max_urls: int = 100,
+        pattern: str = "*",
+    ) -> List[str]:
+        """Discover URLs from a domain using MCP map_domain tool.
+
+        Uses sitemaps or Common Crawl to discover URLs.
+
+        Args:
+            domain: Domain to map (e.g., 'example.com' or 'https://example.com')
+            max_urls: Maximum URLs to return (default: 100)
+            pattern: URL pattern filter (e.g., '*/docs/*')
+
+        Returns:
+            List of discovered URLs
+        """
+        try:
+            client = await self._get_client()
+            result = await client.call_tool("map_domain", {
+                "domain": domain,
+                "max_urls": max_urls,
+                "pattern": pattern,
+            })
+
+            # Parse the result
+            if isinstance(result, str):
+                try:
+                    data = json.loads(result)
+                    urls = data.get("urls", [])
+                    logger.info(f"[MCP] map_domain found {len(urls)} URLs for {domain}")
+                    return urls
+                except json.JSONDecodeError:
+                    logger.warning(f"[MCP] Failed to parse map_domain result")
+                    return []
+            elif isinstance(result, dict):
+                urls = result.get("urls", [])
+                logger.info(f"[MCP] map_domain found {len(urls)} URLs for {domain}")
+                return urls
+            else:
+                logger.warning(f"[MCP] Unexpected map_domain result type: {type(result)}")
+                return []
+
+        except Exception as e:
+            logger.error(f"[MCP] map_domain failed for {domain}: {e}")
+            return []
+
+    async def crawl_site(
+        self,
+        url: str,
+        max_depth: int = 2,
+        max_pages: int = 50,
+        include_patterns: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Deep crawl a site following links using MCP crawl_site tool.
+
+        Args:
+            url: Starting URL to crawl
+            max_depth: Maximum depth to crawl (1-5, default: 2)
+            max_pages: Maximum pages to crawl (1-200, default: 50)
+            include_patterns: URL patterns to include (e.g., ['*api*', '*docs*'])
+            exclude_patterns: URL patterns to exclude (e.g., ['*deprecated*'])
+
+        Returns:
+            List of crawled pages with content
+        """
+        try:
+            client = await self._get_client()
+            args = {
+                "url": url,
+                "max_depth": max_depth,
+                "max_pages": max_pages,
+            }
+            if include_patterns:
+                args["include_patterns"] = include_patterns
+            if exclude_patterns:
+                args["exclude_patterns"] = exclude_patterns
+
+            result = await client.call_tool("crawl_site", args)
+
+            # Parse the result
+            if isinstance(result, str):
+                try:
+                    data = json.loads(result)
+                    pages = data.get("pages", [])
+                    logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
+                    return pages
+                except json.JSONDecodeError:
+                    logger.warning(f"[MCP] Failed to parse crawl_site result")
+                    return []
+            elif isinstance(result, dict):
+                pages = result.get("pages", [])
+                logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
+                return pages
+            else:
+                logger.warning(f"[MCP] Unexpected crawl_site result type: {type(result)}")
+                return []
+
+        except Exception as e:
+            logger.error(f"[MCP] crawl_site failed for {url}: {e}")
+            return []
+
     async def map_website(
         self,
         url: str,
@@ -581,6 +685,44 @@ async def scrape_batch(urls: List[str], **kwargs) -> List[Dict[str, Any]]:
         await scraper.close()
 
 
+async def map_domain(
+    domain: str,
+    max_urls: int = 100,
+    pattern: str = "*",
+    **kwargs,
+) -> List[str]:
+    """Discover URLs from a domain using MCP map_domain tool."""
+    config = MCPConfig()
+    scraper = MCPWebScraper(config)
+    try:
+        return await scraper.map_domain(domain, max_urls=max_urls, pattern=pattern)
+    finally:
+        await scraper.close()
+
+
+async def crawl_site(
+    url: str,
+    max_depth: int = 2,
+    max_pages: int = 50,
+    include_patterns: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    **kwargs,
+) -> List[Dict[str, Any]]:
+    """Deep crawl a site following links using MCP crawl_site tool."""
+    config = MCPConfig()
+    scraper = MCPWebScraper(config)
+    try:
+        return await scraper.crawl_site(
+            url,
+            max_depth=max_depth,
+            max_pages=max_pages,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        )
+    finally:
+        await scraper.close()
+
+
 __all__ = [
     "MCPConfig",
     "MCPClient",
@@ -588,4 +730,6 @@ __all__ = [
     "map_website",
     "scrape_url",
     "scrape_batch",
+    "map_domain",
+    "crawl_site",
 ]

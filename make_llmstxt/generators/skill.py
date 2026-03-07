@@ -9,10 +9,14 @@ The generator uses Deep Agents' built-in filesystem tools to create:
 - SKILL.md (with YAML frontmatter)
 - references/ (scraped documentation)
 - scripts/ (extracted code examples)
+
+MCP tools are loaded via langchain-mcp-adapters and distributed:
+- Main agent: map_domain, crawl_site (discovery tools)
+- Subagents: scrape_url (single page fetching)
 """
 
 from pathlib import Path
-from typing import Optional, List, Callable, Dict, Any, Literal
+from typing import Optional, List, Callable
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -20,11 +24,14 @@ from langgraph.graph import StateGraph, MessagesState, END
 from langgraph.prebuilt import create_react_agent
 from deepagents import create_deep_agent
 from langchain_openai import ChatOpenAI
-from langchain_core.tools import tool
-from pydantic import BaseModel
 
-from make_llmstxt.core import GeneratorConfig, ScrapedPage, GeneratorResult
-from make_llmstxt.mcp_scraper import MCPWebScraper, MCPConfig
+from make_llmstxt.core import GeneratorConfig, GeneratorResult
+from make_llmstxt.mcp_tools import (
+    get_mcp_tools,
+    filter_tools_by_name,
+    MAIN_AGENT_TOOL_NAMES,
+    SUBAGENT_TOOL_NAMES,
+)
 
 
 # ==============================================================================
@@ -79,57 +86,6 @@ Be strict - a partial skill package is useless."""
 
 
 # ==============================================================================
-# Tools
-# ==============================================================================
-
-def create_tools(scraper: MCPWebScraper, config: GeneratorConfig) -> List:
-    """Create tools for the agents."""
-
-    tools = []
-
-    @tool
-    def scrape_page(url: str) -> dict:
-        """Scrape a single URL and return markdown content.
-
-        Args:
-            url: URL to scrape
-
-        Returns:
-            Dict with url, title, content, metadata
-        """
-        import asyncio
-        result = asyncio.run(scraper.scrape_url(url))
-        if result:
-            return {
-                "url": url,
-                "title": result.get("metadata", {}).get("title", ""),
-                "content": result.get("markdown", ""),
-                "metadata": result.get("metadata", {}),
-            }
-        return {"error": f"Failed to scrape {url}"}
-
-    tools.append(scrape_page)
-
-    @tool
-    def map_site(url: str) -> dict:
-        """Discover URLs from a website using sitemap.
-
-        Args:
-            url: Base URL to map
-
-        Returns:
-            Dict with urls (list of discovered URLs)
-        """
-        import asyncio
-        urls = asyncio.run(scraper.map_website(url, limit=config.max_urls))
-        return {"urls": urls}
-
-    tools.append(map_site)
-
-    return tools
-
-
-# ==============================================================================
 # Graph Builder
 # ==============================================================================
 
@@ -149,50 +105,6 @@ class SkillGenerator:
 
     def __init__(self, config: GeneratorConfig):
         self.config = config
-        self._scraper: Optional[MCPWebScraper] = None
-
-    async def _get_scraper(self) -> MCPWebScraper:
-        """Get or create MCP scraper instance."""
-        if self._scraper is None:
-            mcp_config = MCPConfig(
-                host=self.config.mcp_host,
-                port=self.config.mcp_port,
-            )
-            self._scraper = MCPWebScraper(mcp_config)
-        return self._scraper
-
-    async def gather_content(self, url: str) -> List[ScrapedPage]:
-        """Gather content from the target URL.
-
-        Args:
-            url: Target URL to process
-
-        Returns:
-            List of scraped pages with markdown content
-        """
-        scraper = await self._get_scraper()
-
-        # Discover URLs
-        logger.info(f"[SkillGenerator] Mapping website: {url}")
-        urls = await scraper.map_website(url, limit=self.config.max_urls)
-        logger.info(f"[SkillGenerator] Found {len(urls)} URLs")
-
-        # Scrape pages
-        logger.info(f"[SkillGenerator] Scraping {len(urls)} pages...")
-        pages = await scraper.scrape_batch(urls)
-
-        # Convert to ScrapedPage objects
-        scraped_pages = []
-        for page in pages:
-            scraped_pages.append(ScrapedPage(
-                url=page.get("url", ""),
-                title=page.get("metadata", {}).get("title"),
-                markdown=page.get("markdown", ""),
-                metadata=page.get("metadata", {}),
-            ))
-
-        logger.info(f"[SkillGenerator] Scraped {len(scraped_pages)} pages successfully")
-        return scraped_pages
 
     def _extract_name(self, url: str) -> str:
         """Extract library name from URL."""
@@ -203,15 +115,6 @@ class SkillGenerator:
         if domain.startswith("docs."):
             domain = domain[5:]
         return domain.split(".")[0]
-
-    def _build_content_summary(self, pages: List[ScrapedPage]) -> str:
-        """Build a summary of gathered content for the agent."""
-        summaries = []
-        for page in pages[:20]:  # Include more pages for skill generation
-            title = page.title or page.url
-            content = page.markdown[:1000]  # More content for better skill generation
-            summaries.append(f"### {title}\nURL: {page.url}\n{content}...\n")
-        return "\n\n".join(summaries)
 
     async def generate(
         self,
@@ -237,97 +140,96 @@ class SkillGenerator:
         logger.info(f"[SkillGenerator] Output directory: {skill_dir}")
 
         if progress_callback:
-            progress_callback("Gathering documentation...", 10)
+            progress_callback("Connecting to MCP server...", 10)
 
-        # Step 1: Gather content
-        pages = await self.gather_content(url)
-        logger.info(f"[SkillGenerator] Gathered {len(pages)} pages")
+        # Connect to MCP server and get tools
+        async with get_mcp_tools(self.config.mcp_host, self.config.mcp_port) as all_tools:
+            # Filter tools for main agent and subagents
+            main_tools = filter_tools_by_name(all_tools, MAIN_AGENT_TOOL_NAMES)
+            subagent_tools = filter_tools_by_name(all_tools, SUBAGENT_TOOL_NAMES)
 
-        if progress_callback:
-            progress_callback(f"Gathered {len(pages)} pages", 20)
+            logger.info(f"[SkillGenerator] Main agent tools: {[t.name for t in main_tools]}")
+            logger.info(f"[SkillGenerator] Subagent tools: {[t.name for t in subagent_tools]}")
 
-        # Step 2: Create tools
-        scraper = await self._get_scraper()
-        tools = create_tools(scraper, self.config)
+            if progress_callback:
+                progress_callback("Building LangGraph...", 20)
 
-        if progress_callback:
-            progress_callback("Building LangGraph...", 30)
+            # Build the hierarchical graph
+            llm = ChatOpenAI(
+                model=self.config.model,
+                temperature=self.config.temperature,
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+            )
 
-        # Step 3: Build the hierarchical graph
-        llm = ChatOpenAI(
-            model=self.config.model,
-            temperature=self.config.temperature,
-            api_key=self.config.api_key,
-            base_url=self.config.base_url,
-        )
+            # Supervisor agent
+            supervisor = create_react_agent(
+                llm,
+                tools=[],  # Supervisor just plans, doesn't scrape
+                state_modifier=SUPERVISOR_PROMPT,
+            )
 
-        # Supervisor agent
-        supervisor = create_react_agent(
-            llm,
-            tools=[],  # Supervisor just plans, doesn't scrape
-            state_modifier=SUPERVISOR_PROMPT,
-        )
+            # Generator agent (Deep Agent with filesystem tools)
+            # Main agent gets map_domain and crawl_site for discovery
+            # Subagents only get scrape_url for individual page fetching
+            generator_agent = create_deep_agent(
+                model=llm,
+                tools=main_tools,  # map_domain, crawl_site for main agent
+                subagent_tools=subagent_tools,  # scrape_url only for subagents
+                system_prompt=GENERATOR_PROMPT.format(
+                    output_dir=str(output_dir),
+                    library_name=library_name,
+                ),
+            )
 
-        # Generator agent (Deep Agent with filesystem tools)
-        generator_agent = create_deep_agent(
-            model=llm,
-            tools=tools,
-            system_prompt=GENERATOR_PROMPT.format(
-                output_dir=str(output_dir),
-                library_name=library_name,
-            ),
-        )
+            # Critic agent
+            critic = create_react_agent(
+                llm,
+                tools=[],  # Critic just reviews
+                state_modifier=CRITIC_PROMPT,
+            )
 
-        # Critic agent
-        critic = create_react_agent(
-            llm,
-            tools=[],  # Critic just reviews
-            state_modifier=CRITIC_PROMPT,
-        )
+            if progress_callback:
+                progress_callback("Running skill generation graph...", 30)
 
-        if progress_callback:
-            progress_callback("Running skill generation graph...", 40)
+            # Build the graph with max iterations guard
+            def should_continue(state: MessagesState) -> str:
+                """Router: Check if critic approved or needs fixes."""
+                # Check iteration count to prevent infinite loops
+                message_count = len(state.get("messages", []))
+                iteration = message_count // 3  # Each iteration = supervisor + generator + critic
 
-        # Step 4: Build the graph with max iterations guard
-        def should_continue(state: MessagesState) -> str:
-            """Router: Check if critic approved or needs fixes."""
-            # Check iteration count to prevent infinite loops
-            message_count = len(state.get("messages", []))
-            iteration = message_count // 3  # Each iteration = supervisor + generator + critic
+                if iteration >= self.config.max_rounds:
+                    logger.warning(f"[SkillGenerator] Max iterations ({self.config.max_rounds}) reached, ending")
+                    return END
 
-            if iteration >= self.config.max_rounds:
-                logger.warning(f"[SkillGenerator] Max iterations ({self.config.max_rounds}) reached, ending")
-                return END
+                last_message = state["messages"][-1].content
+                if "APPROVE" in last_message.upper():
+                    return END
+                return "generator"  # Loop back to fix issues
 
-            last_message = state["messages"][-1].content
-            if "APPROVE" in last_message.upper():
-                return END
-            return "generator"  # Loop back to fix issues
+            graph = StateGraph(MessagesState)
+            graph.add_node("supervisor", supervisor)
+            graph.add_node("generator", generator_agent)
+            graph.add_node("critic", critic)
 
-        graph = StateGraph(MessagesState)
-        graph.add_node("supervisor", supervisor)
-        graph.add_node("generator", generator_agent)
-        graph.add_node("critic", critic)
+            graph.set_entry_point("supervisor")
+            graph.add_edge("supervisor", "generator")
+            graph.add_edge("generator", "critic")
+            graph.add_conditional_edges("critic", should_continue)
 
-        graph.set_entry_point("supervisor")
-        graph.add_edge("supervisor", "generator")
-        graph.add_edge("generator", "critic")
-        graph.add_conditional_edges("critic", should_continue)
+            app = graph.compile()
 
-        app = graph.compile()
-
-        # Step 5: Run the graph
-        content_summary = self._build_content_summary(pages)
-        initial_message = f"""Create a skill package for {library_name}.
+            # Run the graph
+            initial_message = f"""Create a skill package for {library_name}.
 
 URL: {url}
 Output directory: {output_dir}
 Library name: {library_name}
 
-Gathered Documentation:
----
-{content_summary}
----
+Use the available tools to discover and scrape documentation:
+1. Use map_domain or crawl_site to find documentation pages
+2. Scrape key pages to understand the library
 
 Create the folder structure:
 1. {skill_dir}/SKILL.md (with YAML frontmatter)
@@ -335,50 +237,46 @@ Create the folder structure:
 3. {skill_dir}/scripts/ (code examples)
 """
 
-        logger.info(f"[SkillGenerator] Running LangGraph...")
-        result = await app.ainvoke({
-            "messages": [{"role": "user", "content": initial_message}]
-        })
+            logger.info(f"[SkillGenerator] Running LangGraph...")
+            result = await app.ainvoke({
+                "messages": [{"role": "user", "content": initial_message}]
+            })
 
-        if progress_callback:
-            progress_callback("Skill package generated", 90)
-
-        # Step 6: Check output
-        skill_file = skill_dir / "SKILL.md"
-        if skill_file.exists():
-            logger.info(f"[SkillGenerator] Skill package created at {skill_dir}")
             if progress_callback:
-                progress_callback(f"Skill package created at {skill_dir}", 100)
-            return GeneratorResult(
-                output_path=skill_file,
-                stats={
-                    "pages_processed": len(pages),
-                    "output_dir": str(skill_dir),
-                    "files_created": len(list(skill_dir.rglob("*"))) if skill_dir.exists() else 0,
-                },
-            )
-        else:
-            logger.warning(f"[SkillGenerator] SKILL.md not created, checking graph output")
-            # Fallback: extract content from last message
-            final_message = result.get("messages", [])[-1] if result.get("messages") else None
-            if final_message:
-                content = final_message.content if hasattr(final_message, 'content') else str(final_message)
-                # Write the content anyway
-                skill_dir.mkdir(parents=True, exist_ok=True)
-                skill_file.write_text(content)
-                logger.info(f"[SkillGenerator] Wrote fallback SKILL.md")
+                progress_callback("Skill package generated", 90)
 
-            return GeneratorResult(
-                output_path=skill_file,
-                stats={
-                    "pages_processed": len(pages),
-                    "output_dir": str(skill_dir),
-                    "fallback": True,
-                },
-            )
+            # Check output
+            skill_file = skill_dir / "SKILL.md"
+            if skill_file.exists():
+                logger.info(f"[SkillGenerator] Skill package created at {skill_dir}")
+                if progress_callback:
+                    progress_callback(f"Skill package created at {skill_dir}", 100)
+                return GeneratorResult(
+                    output_path=skill_file,
+                    stats={
+                        "output_dir": str(skill_dir),
+                        "files_created": len(list(skill_dir.rglob("*"))) if skill_dir.exists() else 0,
+                    },
+                )
+            else:
+                logger.warning(f"[SkillGenerator] SKILL.md not created, checking graph output")
+                # Fallback: extract content from last message
+                final_message = result.get("messages", [])[-1] if result.get("messages") else None
+                if final_message:
+                    content = final_message.content if hasattr(final_message, 'content') else str(final_message)
+                    # Write the content anyway
+                    skill_dir.mkdir(parents=True, exist_ok=True)
+                    skill_file.write_text(content)
+                    logger.info(f"[SkillGenerator] Wrote fallback SKILL.md")
+
+                return GeneratorResult(
+                    output_path=skill_file,
+                    stats={
+                        "output_dir": str(skill_dir),
+                        "fallback": True,
+                    },
+                )
 
     async def close(self):
         """Clean up resources."""
-        if self._scraper:
-            await self._scraper.close()
-            self._scraper = None
+        pass  # MCP connection managed by context manager

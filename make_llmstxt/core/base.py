@@ -6,32 +6,21 @@ from typing import Optional, List, Callable
 
 from loguru import logger
 
-from . import MCPWebScraper, MCPConfig
 from . import GeneratorConfig, ScrapedPage, GeneratorResult
+from ..mcp_tools import mcp_map_website, mcp_scrape_batch
 
 
 class BaseGenerator(ABC):
     """Abstract base class for all generators.
 
     Provides:
-    - MCP scraper for content gathering
+    - MCP tools for content gathering
     - Configuration management
     - Progress callbacks
     """
 
     def __init__(self, config: GeneratorConfig):
         self.config = config
-        self._scraper: Optional[MCPWebScraper] = None
-
-    async def _get_scraper(self) -> MCPWebScraper:
-        """Get or create MCP scraper instance."""
-        if self._scraper is None:
-            mcp_config = MCPConfig(
-                host=self.config.mcp_host,
-                port=self.config.mcp_port,
-            )
-            self._scraper = MCPWebScraper(mcp_config)
-        return self._scraper
 
     async def gather_content(self, url: str) -> List[ScrapedPage]:
         """Gather content from the target URL.
@@ -44,12 +33,12 @@ class BaseGenerator(ABC):
         Returns:
             List of scraped pages with markdown content
         """
-        scraper = await self._get_scraper()
-
         # Discover URLs
         logger.info(f"[BaseGenerator] Mapping website: {url}")
-        urls = await scraper.map_website(
-            url,
+        urls = await mcp_map_website(
+            host=self.config.mcp_host,
+            port=self.config.mcp_port,
+            url=url,
             limit=self.config.max_urls,
         )
 
@@ -57,7 +46,11 @@ class BaseGenerator(ABC):
 
         # Scrape pages
         logger.info(f"[BaseGenerator] Scraping {len(urls)} pages...")
-        pages = await scraper.scrape_batch(urls)
+        pages = await mcp_scrape_batch(
+            host=self.config.mcp_host,
+            port=self.config.mcp_port,
+            urls=urls,
+        )
 
         # Convert to ScrapedPage objects
         scraped_pages = []
@@ -93,6 +86,4 @@ class BaseGenerator(ABC):
 
     async def close(self):
         """Clean up resources."""
-        if self._scraper:
-            await self._scraper.close()
-            self._scraper = None
+        pass  # MCP connections managed per-call in mcp_tools
