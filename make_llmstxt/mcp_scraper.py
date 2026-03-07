@@ -310,14 +310,16 @@ class MCPWebScraper:
     def __init__(self, config: MCPConfig):
         self.config = config
         self._client: Optional[MCPClient] = None
+        self._client_lock = asyncio.Lock()
 
     async def _get_client(self) -> MCPClient:
-        """Get or create MCP client."""
-        if self._client is None or self._client.session_id is None:
-            self._client = MCPClient(self.config)
-            connected = await self._client.connect()
-            if not connected:
-                raise RuntimeError("Failed to connect to MCP server")
+        """Get or create MCP client (thread-safe)."""
+        async with self._client_lock:
+            if self._client is None or self._client.session_id is None:
+                self._client = MCPClient(self.config)
+                connected = await self._client.connect()
+                if not connected:
+                    raise RuntimeError("Failed to connect to MCP server")
         return self._client
 
     async def close(self):
@@ -433,9 +435,13 @@ class MCPWebScraper:
             # Scrape homepage to find links
             homepage = await self.scrape_url(base_url)
             if homepage:
-                links = self._extract_links(homepage.get("markdown", ""), base_url)
-                discovered.update(links)
-                logger.info(f"[MCP] Found {len(links)} links on homepage")
+                markdown = homepage.get("markdown", "")
+                if markdown:
+                    links = self._extract_links(markdown, base_url)
+                    discovered.update(links)
+                    logger.info(f"[MCP] Found {len(links)} links on homepage")
+                else:
+                    logger.debug(f"[MCP] No markdown content in homepage response")
 
         # Filter to same domain and limit
         same_domain = [
@@ -449,27 +455,34 @@ class MCPWebScraper:
         return same_domain[:limit]
 
     async def _fetch_sitemap(self, base_url: str) -> List[str]:
-        """Fetch and parse sitemap.xml."""
+        """Fetch and parse sitemap.xml.
+
+        Uses direct HTTP fetch to get raw XML, since MCP scraper
+        may transform XML to markdown.
+        """
         sitemap_url = f"{base_url}/sitemap.xml"
         urls = []
 
         try:
-            client = await self._get_client()
+            # Fetch sitemap directly with httpx to get raw XML
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                response = await http_client.get(sitemap_url)
+                response.raise_for_status()
+                xml_content = response.text
 
-            # Try to fetch sitemap
-            result = await client.call_tool("scrape_url", {"url": sitemap_url})
-
-            if isinstance(result, str) and "<urlset" in result:
+            if xml_content and "<urlset" in xml_content:
                 # Parse XML sitemap
                 import xml.etree.ElementTree as ET
 
                 # Remove namespace issues
-                result = re.sub(r'\sxmlns="[^"]+"', '', result)
+                xml_content = re.sub(r'\sxmlns="[^"]+"', '', xml_content)
 
-                root = ET.fromstring(result)
+                root = ET.fromstring(xml_content)
                 for url_elem in root.findall(".//url/loc"):
                     if url_elem.text:
                         urls.append(url_elem.text.strip())
+
+                logger.debug(f"[MCP] Parsed {len(urls)} URLs from sitemap")
 
         except Exception as e:
             logger.debug(f"[MCP] Sitemap fetch failed: {e}")

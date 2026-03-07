@@ -144,10 +144,10 @@ class TestSimpleDraftCritic:
     @pytest.mark.asyncio
     async def test_draft_generation(self, mock_config, mock_llm_response):
         """Test draft generation."""
-        with patch("make_llmstxt.deep_draft.init_chat_model") as mock_init:
-            mock_model = MagicMock()
-            mock_model.ainvoke = AsyncMock(return_value=mock_llm_response)
-            mock_init.return_value = mock_model
+        with patch("make_llmstxt.deep_draft.ChatOpenAI") as mock_chat:
+            mock_instance = MagicMock()
+            mock_instance.ainvoke = AsyncMock(return_value=mock_llm_response)
+            mock_chat.return_value = mock_instance
 
             critic = SimpleDraftCritic(config=mock_config)
 
@@ -159,13 +159,18 @@ class TestSimpleDraftCritic:
             assert "# Test Project" in result or "test" in result.lower()
 
     @pytest.mark.asyncio
-    async def test_critique_passes(self, mock_config, mock_critic_response):
+    async def test_critique_passes(self, mock_config):
         """Test critique when draft passes."""
-        with patch("make_llmstxt.deep_draft.init_chat_model") as mock_init:
-            mock_model = MagicMock()
-            mock_model.ainvoke = AsyncMock(return_value=mock_critic_response)
-            mock_model.with_structured_output.return_value = mock_model
-            mock_init.return_value = mock_model
+        with patch("make_llmstxt.deep_draft.ChatOpenAI") as mock_chat:
+            mock_instance = MagicMock()
+            # First call = evaluation, Second call = extraction
+            mock_instance.ainvoke = AsyncMock(
+                side_effect=[
+                    MagicMock(content="The draft looks good. It has proper structure."),
+                    MagicMock(content='{"passed": true, "score": 0.85, "issues": [], "suggestions": []}'),
+                ]
+            )
+            mock_chat.return_value = mock_instance
 
             critic = SimpleDraftCritic(config=mock_config)
 
@@ -176,4 +181,3 @@ class TestSimpleDraftCritic:
 
             assert result.passed is True
             assert result.score >= 0.7
-

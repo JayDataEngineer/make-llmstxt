@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from loguru import logger
 
 from deepagents import create_deep_agent
-from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 
 from .critic import CriticResult
@@ -157,18 +157,18 @@ class DeepDraftAgent:
         """
         self.config = config or DeepDraftConfig()
 
-        # Initialize models
+        # Initialize models using ChatOpenAI directly (supports any OpenAI-compatible API)
         model_kwargs = {"temperature": self.config.temperature}
         if api_key:
             model_kwargs["api_key"] = api_key
         if base_url:
             model_kwargs["base_url"] = base_url
 
-        self.drafter_model = init_chat_model(
+        self.drafter_model = ChatOpenAI(
             model=self.config.drafter_model,
             **model_kwargs,
         )
-        self.critic_model = init_chat_model(
+        self.critic_model = ChatOpenAI(
             model=self.config.critic_model,
             **model_kwargs,
         )
@@ -342,13 +342,11 @@ class SimpleDraftCritic:
         if base_url:
             model_kwargs["base_url"] = base_url
 
-        self.llm = init_chat_model(
+        # Use ChatOpenAI directly (supports any OpenAI-compatible API)
+        self.llm = ChatOpenAI(
             model=self.config.drafter_model,
             **model_kwargs,
         )
-
-        # Critic with structured output
-        self.critic_llm = self.llm.with_structured_output(CriticResult)
 
     async def draft(
         self,
@@ -378,7 +376,11 @@ class SimpleDraftCritic:
         return response.content if hasattr(response, 'content') else str(response)
 
     async def critique(self, llmstxt: str, url: Optional[str] = None) -> CriticResult:
-        """Evaluate a draft using structured output.
+        """Evaluate a draft using "Draft then Extract" pattern.
+
+        This method:
+        1. First gets free-form evaluation from LLM (text response)
+        2. Then extracts structured data using JSON parsing with explicit prompting
 
         Args:
             llmstxt: The llms.txt content to evaluate
@@ -386,51 +388,98 @@ class SimpleDraftCritic:
 
         Returns:
             Structured CriticResult
-        """
-        from langchain_core.messages import HumanMessage
-        from .prompts import build_critic_prompt
 
+        Raises:
+            ValueError: If LLM returns invalid JSON or non-JSON response
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from .prompts import build_critic_prompt, CRITIC_SYSTEM_PROMPT
+
+        # Step 1: Get free-form evaluation from LLM
         prompt = build_critic_prompt(llmstxt, None, url)
-        messages = [HumanMessage(content=prompt)]
+        messages = [
+            SystemMessage(content=CRITIC_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
 
         try:
-            result = await self.critic_llm.ainvoke(messages)
-
-            # Handle string response (some providers wrap JSON)
-            if isinstance(result, str):
-                import json
-                import re
-                text = result.strip()
-                if text.startswith("```"):
-                    match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
-                    if match:
-                        text = match.group(1).strip()
-                data = json.loads(text)
-                result = CriticResult(**data)
-
-            # Apply threshold override
-            if result.score >= self.config.pass_threshold and not result.passed:
-                logger.info(
-                    f"[SimpleDraftCritic] Overriding passed=True "
-                    f"(score {result.score:.2f} >= threshold {self.config.pass_threshold})"
-                )
-                result = CriticResult(
-                    passed=True,
-                    score=result.score,
-                    issues=result.issues,
-                    suggestions=result.suggestions,
-                )
-
-            return result
-
+            response = await self.llm.ainvoke(messages)
+            evaluation_text = response.content if hasattr(response, 'content') else str(response)
+            logger.debug(f"[SimpleDraftCritic] Evaluation text ({len(evaluation_text)} chars)")
         except Exception as e:
-            logger.error(f"[SimpleDraftCritic] Critique failed: {e}")
-            return CriticResult(
-                passed=False,
-                score=0.0,
-                issues=[f"Critique error: {e}"],
-                suggestions=["Check LLM configuration and retry"],
+            raise ValueError(f"LLM call failed during evaluation: {e}")
+
+        # Step 2: Extract structured result using JSON parsing with explicit prompting
+        extraction_prompt = f"""Based on the evaluation, extract the structured result as JSON.
+
+        Evaluation text:
+        ---
+        {evaluation_text}
+        ---
+
+        The output must match this JSON schema:
+        {{
+            "passed": boolean,
+            "score": float (0.0-1.0),
+            "issues": ["string"],
+            "suggestions": ["string"]
+        }}
+
+        IMPORTANT:
+        - Return ONLY valid JSON (no markdown, no code blocks)
+        - Be strict: passed=True only if ALL rules are satisfied
+        - Include all issues found, even minor ones
+        """
+
+        extraction_messages = [
+            HumanMessage(content=extraction_prompt),
+        ]
+
+        try:
+            extraction_response = await self.llm.ainvoke(extraction_messages)
+            extraction_text = extraction_response.content if hasattr(extraction_response, 'content') else str(extraction_response)
+            logger.debug(f"[SimpleDraftCritic] Extraction text ({len(extraction_text)} chars)")
+        except Exception as e:
+            raise ValueError(f"LLM call failed during extraction: {e}")
+
+        # Parse JSON response
+        import json
+        import re
+
+        text = extraction_text.strip()
+        if "```json" in text:
+            match = re.search(r'```json\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
+            if match:
+                text = match.group(1).strip()
+        elif "```" in text:
+            match = re.search(r'```\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
+            if match:
+                text = match.group(1).strip()
+
+        try:
+            data = json.loads(text)
+            result = CriticResult(**data)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Failed to parse LLM response as JSON. "
+                f"Expected format: {{\"passed\": bool, \"score\": float, \"issues\": [...], \"suggestions\": [...]}}. "
+                f"Got: {text[:200]}..."
             )
+
+        # Apply threshold override
+        if result.score >= self.config.pass_threshold and not result.passed:
+            logger.info(
+                f"[SimpleDraftCritic] Overriding passed=True "
+                f"(score {result.score:.2f} >= threshold {self.config.pass_threshold})"
+            )
+            result = CriticResult(
+                passed=True,
+                score=result.score,
+                issues=result.issues,
+                suggestions=result.suggestions,
+            )
+
+        return result
 
     async def generate(
         self,
