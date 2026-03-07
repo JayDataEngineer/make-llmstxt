@@ -401,7 +401,7 @@ class MCPWebScraper:
     async def map_website(
         self,
         url: str,
-        limit: int = 100,
+        limit: Optional[int] = None,
         use_sitemap: bool = True,
     ) -> List[str]:
         """Discover URLs for a website.
@@ -412,7 +412,7 @@ class MCPWebScraper:
 
         Args:
             url: Website URL
-            limit: Maximum URLs to return
+            limit: Maximum URLs to return (None = unlimited)
             use_sitemap: Try sitemap.xml first
 
         Returns:
@@ -431,7 +431,7 @@ class MCPWebScraper:
             logger.info(f"[MCP] Found {len(sitemap_urls)} URLs in sitemap")
 
         # Strategy 2: If sitemap didn't give enough, try common paths
-        if len(discovered) < limit:
+        if limit is None or len(discovered) < limit:
             # Scrape homepage to find links
             homepage = await self.scrape_url(base_url)
             if homepage:
@@ -452,7 +452,10 @@ class MCPWebScraper:
         # Prioritize important pages
         same_domain = self._prioritize_urls(same_domain, base_url)
 
-        return same_domain[:limit]
+        # Apply limit if specified
+        if limit is not None:
+            return same_domain[:limit]
+        return same_domain
 
     async def _fetch_sitemap(self, base_url: str) -> List[str]:
         """Fetch and parse sitemap.xml.
@@ -548,7 +551,7 @@ class MCPWebScraper:
 
 # Convenience functions for drop-in replacement with firecrawl module
 
-async def map_website(url: str, limit: int = 100, **kwargs) -> List[str]:
+async def map_website(url: str, limit: Optional[int] = None, **kwargs) -> List[str]:
     """Map website to get URLs."""
     config = MCPConfig()
     scraper = MCPWebScraper(config)

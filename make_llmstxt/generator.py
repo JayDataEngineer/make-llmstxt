@@ -236,7 +236,7 @@ class LLMsTxtGenerator:
                 llmstxt=llmstxt,
                 llms_fulltxt=llms_fulltxt,
                 num_urls_processed=len(pages),
-                num_urls_total=max_urls,
+                num_urls_total=max_urls if max_urls is not None else len(pages),
                 pages=pages,
                 critic_passed=True,
                 critic_score=1.0,
@@ -249,14 +249,14 @@ class LLMsTxtGenerator:
     async def _scrape_website(
         self,
         url: str,
-        max_urls: int,
+        max_urls: Optional[int],
         progress_callback: Optional[Callable] = None,
     ) -> tuple[str, List[PageResult]]:
         """Scrape website and return content string and page results.
 
         Args:
             url: Website URL
-            max_urls: Maximum URLs to scrape
+            max_urls: Maximum URLs to scrape (None = unlimited)
             progress_callback: Progress callback
 
         Returns:
@@ -271,8 +271,9 @@ class LLMsTxtGenerator:
         if not all_urls:
             raise ValueError(f"No URLs found for website: {url}")
 
-        # Limit URLs
-        all_urls = all_urls[:max_urls]
+        # Limit URLs (None = unlimited)
+        if max_urls is not None:
+            all_urls = all_urls[:max_urls]
 
         # Process in batches
         all_results: List[PageResult] = []

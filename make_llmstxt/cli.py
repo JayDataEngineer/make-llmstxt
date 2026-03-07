@@ -80,8 +80,8 @@ Environment Variables:
     parser.add_argument(
         "--max-urls",
         type=int,
-        default=20,
-        help="Maximum number of URLs to process (default: 20)",
+        default=None,
+        help="Maximum number of URLs to process (default: unlimited, process all URLs in sitemap)",
     )
     parser.add_argument(
         "--output-dir",

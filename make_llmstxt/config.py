@@ -57,7 +57,7 @@ class AppConfig(BaseModel):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
 
     # Generation settings
-    max_urls: int = Field(default=20, description="Maximum URLs to process")
+    max_urls: Optional[int] = Field(default=None, description="Maximum URLs to process (None = unlimited)")
     batch_size: int = Field(default=10, description="URLs per batch")
 
     @classmethod
