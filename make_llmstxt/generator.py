@@ -5,12 +5,12 @@ Generates:
 - llms-full.txt: Full content of all pages
 
 Scraping via custom MCP server.
-Includes Critic + Retry pattern for quality assurance.
+Uses Deep Agents Draft-Critic pattern for quality assurance.
 """
 
 import re
 import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,7 +20,12 @@ from langchain_openai import ChatOpenAI
 from .config import AppConfig
 from .mcp_scraper import MCPWebScraper
 from .llm import create_llm, generate_summaries_batch
-from .critic import Critic, CriticResult
+from .critic import CriticResult
+from .deep_draft import (
+    DeepDraftConfig,
+    SimpleDraftCritic,
+    DraftState,
+)
 
 
 @dataclass
@@ -58,6 +63,7 @@ class LLMsTxtGenerator:
     """Generate llms.txt and llms-full.txt for websites.
 
     Scraping via custom MCP server.
+    Uses Deep Agents Draft-Critic pattern for iterative quality improvement.
     """
 
     def __init__(
@@ -67,6 +73,7 @@ class LLMsTxtGenerator:
         scraper: Optional[MCPWebScraper] = None,
         pass_threshold: float = 0.7,
         fail_on_critic_error: bool = False,
+        max_rounds: int = 3,
     ):
         """Initialize generator.
 
@@ -76,20 +83,23 @@ class LLMsTxtGenerator:
             scraper: Optional pre-configured MCP scraper
             pass_threshold: Minimum critic score to pass (0.0-1.0)
             fail_on_critic_error: Fail generation if critic errors
+            max_rounds: Maximum draft-critic rounds (default: 3)
         """
         self.config = config
         self._external_scraper = scraper is not None
         self.pass_threshold = pass_threshold
         self.fail_on_critic_error = fail_on_critic_error
+        self.max_rounds = max_rounds
 
         # Create LLM if not provided
         self.llm = llm or create_llm(config.llm)
 
-        # Create critic
-        self.critic = Critic(
-            self.llm,
+        # Create Deep Draft Critic
+        self.draft_config = DeepDraftConfig(
+            max_rounds=max_rounds,
             pass_threshold=pass_threshold,
-            fail_on_error=fail_on_critic_error,
+            drafter_model=config.llm.model,
+            temperature=config.llm.temperature,
         )
 
         # Use provided scraper or create from config
@@ -168,93 +178,91 @@ class LLMsTxtGenerator:
         url: str,
         max_urls: Optional[int] = None,
         include_full_text: bool = True,
-        progress_callback: Optional[callable] = None,
+        progress_callback: Optional[Callable] = None,
         enable_critic: bool = True,
         max_retries: int = 2,
     ) -> GenerationResult:
         """Generate llms.txt files for a website.
 
+        Uses the Deep Agents Draft-Critic pattern:
+        1. Scrape website content
+        2. Generate initial draft
+        3. Critic evaluates draft (structured Pydantic output)
+        4. If not approved, revise with feedback
+        5. Repeat until approved or max_rounds reached
+
         Args:
             url: Website URL
             max_urls: Override max URLs from config
             include_full_text: Whether to include full text
-            progress_callback: Optional callback for progress updates
+            progress_callback: Optional callback(stage, current, total, message)
             enable_critic: Whether to use critic validation
-            max_retries: Maximum retry attempts on critic failure
+            max_retries: Maximum revision rounds (deprecated: use max_rounds in config)
 
         Returns:
-            GenerationResult with generated content
+            GenerationResult with generated content and critic metadata
         """
         max_urls = max_urls or self.config.max_urls
-        previous_issues: List[str] = []
-        result: Optional[GenerationResult] = None
 
-        for attempt in range(max_retries + 1):
-            if attempt > 0:
-                logger.warning(f"Retry attempt {attempt}/{max_retries} with {len(previous_issues)} issues to fix")
+        # Step 1: Scrape website content
+        if progress_callback:
+            progress_callback("scraping", 0, 1, f"Scraping {url}...")
 
-            # Generate draft
-            result = await self._generate_draft(
+        scraped_content, pages = await self._scrape_website(
+            url=url,
+            max_urls=max_urls,
+            progress_callback=progress_callback,
+        )
+
+        if not pages:
+            raise ValueError(f"No content scraped from: {url}")
+
+        # Step 2: Generate using Deep Draft pattern (if critic enabled)
+        if enable_critic:
+            result = await self._generate_with_deep_draft(
                 url=url,
-                max_urls=max_urls,
+                scraped_content=scraped_content,
+                pages=pages,
                 include_full_text=include_full_text,
                 progress_callback=progress_callback,
-                feedback=previous_issues if attempt > 0 else None,
+            )
+        else:
+            # Skip critic - just format the output
+            llmstxt = self._format_llmstxt(url, pages)
+            llms_fulltxt = (
+                self._format_llms_fulltxt(url, pages) if include_full_text else ""
+            )
+            result = GenerationResult(
+                llmstxt=llmstxt,
+                llms_fulltxt=llms_fulltxt,
+                num_urls_processed=len(pages),
+                num_urls_total=max_urls,
+                pages=pages,
+                critic_passed=True,
+                critic_score=1.0,
+                critic_issues=[],
+                retry_count=0,
             )
 
-            # Skip critic if disabled or first attempt
-            if not enable_critic:
-                return result
-
-            # Run critic
-            if progress_callback:
-                progress_callback("critiquing", 0, 1, "Validating output quality...")
-
-            critic_result = await self.critic.evaluate(
-                llmstxt=result.llmstxt,
-                llms_fulltxt=result.llms_fulltxt if include_full_text else None,
-                url=url,
-            )
-
-            # Update result with critic metadata
-            result.critic_passed = critic_result.passed
-            result.critic_score = critic_result.score
-            result.critic_issues = critic_result.issues
-            result.retry_count = attempt
-
-            if critic_result.passed:
-                logger.info(f"Critic passed with score {critic_result.score:.2f}")
-                return result
-
-            # Prepare feedback for next iteration
-            logger.warning(f"Critic failed (score {critic_result.score:.2f}): {critic_result.issues}")
-            previous_issues = critic_result.issues + critic_result.suggestions
-
-        # Max retries reached
-        logger.error(f"Max retries ({max_retries}) reached, returning best effort output")
         return result
 
-    async def _generate_draft(
+    async def _scrape_website(
         self,
         url: str,
         max_urls: int,
-        include_full_text: bool,
-        progress_callback: Optional[callable],
-        feedback: Optional[List[str]] = None,
-    ) -> GenerationResult:
-        """Internal method to generate a draft.
+        progress_callback: Optional[Callable] = None,
+    ) -> tuple[str, List[PageResult]]:
+        """Scrape website and return content string and page results.
 
         Args:
             url: Website URL
-            max_urls: Maximum URLs to process
-            include_full_text: Whether to include full text
+            max_urls: Maximum URLs to scrape
             progress_callback: Progress callback
-            feedback: Optional critic feedback for retry
 
         Returns:
-            GenerationResult
+            Tuple of (scraped_content_string, list_of_page_results)
         """
-        # Step 1: Map website
+        # Map website
         if progress_callback:
             progress_callback("mapping", 0, 1, f"Mapping {url}...")
 
@@ -266,7 +274,7 @@ class LLMsTxtGenerator:
         # Limit URLs
         all_urls = all_urls[:max_urls]
 
-        # Step 2: Process in batches
+        # Process in batches
         all_results: List[PageResult] = []
         batch_size = self.config.batch_size
         total_batches = (len(all_urls) + batch_size - 1) // batch_size
@@ -283,7 +291,7 @@ class LLMsTxtGenerator:
                     f"Processing batch {batch_num}/{total_batches} ({len(batch)} URLs)",
                 )
 
-            results = await self.process_batch(batch, start_index=i, feedback=feedback)
+            results = await self.process_batch(batch, start_index=i)
             all_results.extend(results)
 
             # Small delay between batches
@@ -293,22 +301,89 @@ class LLMsTxtGenerator:
         # Sort by index
         all_results.sort(key=lambda x: x.index)
 
-        # Step 3: Generate output
-        if progress_callback:
-            progress_callback("generating", 0, 1, "Generating output files...")
+        # Build content string for LLM
+        content_parts = []
+        for page in all_results:
+            content_parts.append(f"URL: {page.url}")
+            content_parts.append(f"Title: {page.title}")
+            content_parts.append(f"Description: {page.description}")
+            content_parts.append(f"Content:\n{page.markdown[:500]}...")
+            content_parts.append("---")
 
-        llmstxt = self._format_llmstxt(url, all_results)
+        scraped_content = "\n".join(content_parts)
+
+        return scraped_content, all_results
+
+    async def _generate_with_deep_draft(
+        self,
+        url: str,
+        scraped_content: str,
+        pages: List[PageResult],
+        include_full_text: bool,
+        progress_callback: Optional[Callable] = None,
+    ) -> GenerationResult:
+        """Generate using Deep Draft-Critic pattern.
+
+        Args:
+            url: Website URL
+            scraped_content: Formatted scraped content
+            pages: List of page results
+            include_full_text: Whether to include full text
+            progress_callback: Progress callback
+
+        Returns:
+            GenerationResult
+        """
+        logger.info(f"[DeepDraft] Starting generation for {url}")
+        logger.info(f"[DeepDraft] Config: max_rounds={self.draft_config.max_rounds}, threshold={self.draft_config.pass_threshold}")
+
+        # Create Deep Draft Critic
+        critic = SimpleDraftCritic(
+            config=self.draft_config,
+            api_key=self.config.llm.api_key,
+            base_url=self.config.llm.base_url,
+        )
+
+        # Custom progress callback adapter
+        def draft_progress_callback(draft: str, round_num: int, critique: Optional[CriticResult]):
+            if progress_callback and critique:
+                progress_callback(
+                    "critiquing",
+                    round_num,
+                    self.draft_config.max_rounds,
+                    f"Round {round_num}: score={critique.score:.2f}, passed={critique.passed}",
+                )
+
+        # Generate with iterative refinement
+        final_content, state = await critic.generate(
+            url=url,
+            content=scraped_content,
+            progress_callback=draft_progress_callback,
+        )
+
+        # Build result
         llms_fulltxt = (
-            self._format_llms_fulltxt(url, all_results) if include_full_text else ""
+            self._format_llms_fulltxt(url, pages) if include_full_text else ""
         )
 
-        return GenerationResult(
-            llmstxt=llmstxt,
+        result = GenerationResult(
+            llmstxt=final_content,
             llms_fulltxt=llms_fulltxt,
-            num_urls_processed=len(all_results),
-            num_urls_total=len(all_urls),
-            pages=all_results,
+            num_urls_processed=len(pages),
+            num_urls_total=len(pages),
+            pages=pages,
+            critic_passed=state.agreed,
+            critic_score=state.critique.score if state.critique else 1.0,
+            critic_issues=state.critique.issues if state.critique else [],
+            retry_count=state.round - 1 if state.agreed else state.round,
         )
+
+        if state.agreed:
+            logger.info(f"[DeepDraft] Approved at round {state.round} with score {result.critic_score:.2f}")
+        else:
+            logger.warning(f"[DeepDraft] Max rounds reached without approval, returning best effort")
+
+        return result
 
     def _format_llmstxt(self, url: str, pages: List[PageResult]) -> str:
         """Format llms.txt content following the official spec.
@@ -443,7 +518,7 @@ async def generate_llmstxt(
     max_urls: Optional[int] = None,
     include_full_text: bool = True,
     output_dir: Optional[Path] = None,
-    progress_callback: Optional[callable] = None,
+    progress_callback: Optional[Callable] = None,
     enable_critic: bool = True,
     max_retries: int = 2,
     pass_threshold: float = 0.7,
@@ -451,15 +526,17 @@ async def generate_llmstxt(
 ) -> GenerationResult:
     """Generate llms.txt files for a website.
 
+    Uses the Deep Agents Draft-Critic pattern for iterative quality improvement.
+
     Args:
         url: Website URL
         config: Optional app configuration
         max_urls: Override max URLs
         include_full_text: Include full text file
         output_dir: Directory to save files
-        progress_callback: Progress callback
+        progress_callback: Progress callback(stage, current, total, message)
         enable_critic: Enable critic validation
-        max_retries: Max retry attempts
+        max_retries: Maximum draft-critic rounds (alias for max_rounds)
         pass_threshold: Minimum score to pass (0.0-1.0)
         fail_on_critic_error: Fail if critic errors
 
@@ -475,6 +552,7 @@ async def generate_llmstxt(
         config,
         pass_threshold=pass_threshold,
         fail_on_critic_error=fail_on_critic_error,
+        max_rounds=max_retries + 1,  # Convert retries to rounds (rounds = retries + 1)
     )
 
     try:

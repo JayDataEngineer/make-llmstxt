@@ -123,17 +123,17 @@ Environment Variables:
         action="store_true",
         help="Don't generate llms-full.txt file",
     )
-    # Critic options
+    # Deep Draft-Critic options
     parser.add_argument(
         "--no-critic",
         action="store_true",
         help="Disable critic validation (faster but lower quality)",
     )
     parser.add_argument(
-        "--max-retries",
+        "--max-rounds",
         type=int,
-        default=2,
-        help="Max retry attempts on critic failure (default: 2)",
+        default=3,
+        help="Maximum draft-critic rounds (default: 3)",
     )
     parser.add_argument(
         "--pass-threshold",
@@ -260,7 +260,7 @@ Environment Variables:
                     output_dir=Path(args.output_dir),
                     progress_callback=progress_callback,
                     enable_critic=not args.no_critic,
-                    max_retries=args.max_retries,
+                    max_retries=args.max_rounds,
                     pass_threshold=args.pass_threshold,
                     fail_on_critic_error=args.critic_strict,
                 )
