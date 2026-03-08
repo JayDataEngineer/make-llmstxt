@@ -94,7 +94,6 @@ def _extract_tool_result(result: Any) -> Any:
     import json
 
     if isinstance(result, list) and len(result) > 0:
-        # MCP content format: [{'type': 'text', 'text': '...'}]
         first_item = result[0]
         if isinstance(first_item, dict) and first_item.get("type") == "text":
             text = first_item.get("text", "")
@@ -111,6 +110,20 @@ def _extract_tool_result(result: Any) -> Any:
     return result
 
 
+async def _call_mcp_tool(host: str, port: int, tool_name: str, args: dict) -> Any:
+    """Helper to call an MCP tool and return extracted result.
+
+    Reduces boilerplate in mcp_* functions.
+    """
+    client = create_mcp_client(host, port)
+    tools = await client.get_tools()
+    tool = next((t for t in tools if t.name == tool_name), None)
+    if not tool:
+        raise RuntimeError(f"MCP tool '{tool_name}' not found")
+    result = await tool.ainvoke(args)
+    return _extract_tool_result(result)
+
+
 async def mcp_map_domain(
     host: str,
     port: int,
@@ -118,34 +131,13 @@ async def mcp_map_domain(
     max_urls: int = 100,
     pattern: str = "*",
 ) -> List[str]:
-    """Discover URLs from a domain using MCP map_domain tool.
-
-    Args:
-        host: MCP server host
-        port: MCP server port
-        domain: Domain to map (e.g., 'example.com')
-        max_urls: Maximum URLs to return
-        pattern: URL pattern filter
-
-    Returns:
-        List of discovered URL strings
-    """
-    client = create_mcp_client(host, port)
-    tools = await client.get_tools()
-
-    # Find the map_domain tool
-    map_domain_tool = next((t for t in tools if t.name == "map_domain"), None)
-    if not map_domain_tool:
-        logger.error("[MCP] map_domain tool not found")
-        return []
-
-    result = await map_domain_tool.ainvoke({
+    """Discover URLs from a domain using MCP map_domain tool."""
+    data = await _call_mcp_tool(host, port, "map_domain", {
         "domain": domain,
         "max_urls": max_urls,
         "pattern": pattern,
     })
 
-    data = _extract_tool_result(result)
     raw_urls = data.get("urls", []) if isinstance(data, dict) else []
 
     # Extract URL strings from [{"url": "..."}, ...] format
@@ -183,14 +175,6 @@ async def mcp_crawl_site(
     Returns:
         List of crawled pages with content
     """
-    client = create_mcp_client(host, port)
-    tools = await client.get_tools()
-
-    crawl_site_tool = next((t for t in tools if t.name == "crawl_site"), None)
-    if not crawl_site_tool:
-        logger.error("[MCP] crawl_site tool not found")
-        return []
-
     args = {
         "url": url,
         "max_depth": max_depth,
@@ -201,8 +185,7 @@ async def mcp_crawl_site(
     if exclude_patterns:
         args["exclude_patterns"] = exclude_patterns
 
-    result = await crawl_site_tool.ainvoke(args)
-    data = _extract_tool_result(result)
+    data = await _call_mcp_tool(host, port, "crawl_site", args)
     pages = data.get("pages", []) if isinstance(data, dict) else []
 
     logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
@@ -222,37 +205,26 @@ async def mcp_scrape_url(
         url: URL to scrape
 
     Returns:
-        Dict with url, title, content, metadata or None on failure
+        Dict with url, title, content, metadata or raises on failure
     """
-    client = create_mcp_client(host, port)
-    tools = await client.get_tools()
+    data = await _call_mcp_tool(host, port, "scrape_url", {"url": url})
 
-    # Find the scrape_url tool
-    scrape_url_tool = next((t for t in tools if t.name == "scrape_url"), None)
-    if not scrape_url_tool:
-        logger.error("[MCP] scrape_url tool not found")
-        return None
-
-    result = await scrape_url_tool.ainvoke({"url": url})
-
-    data = _extract_tool_result(result)
-
-    if isinstance(data, dict):
-        if data.get("success"):
-            return {
-                "url": data.get("url", url),
-                "title": data.get("title", ""),
-                "content": data.get("content", ""),
-                "markdown": data.get("content", ""),
-                "metadata": {
-                    "title": data.get("title"),
-                    "word_count": data.get("word_count"),
-                },
-            }
-        else:
-            raise RuntimeError(f"MCP scrape_url failed for {url}: {data.get('error', 'Unknown error')}")
-    else:
+    if not isinstance(data, dict):
         raise RuntimeError(f"MCP scrape_url returned unexpected type: {type(data)}")
+
+    if not data.get("success"):
+        raise RuntimeError(f"MCP scrape_url failed for {url}: {data.get('error', 'Unknown error')}")
+
+    return {
+        "url": data.get("url", url),
+        "title": data.get("title", ""),
+        "content": data.get("content", ""),
+        "markdown": data.get("content", ""),
+        "metadata": {
+            "title": data.get("title"),
+            "word_count": data.get("word_count"),
+        },
+    }
 
 
 async def mcp_scrape_batch(

@@ -17,7 +17,7 @@ from loguru import logger
 from langchain_openai import ChatOpenAI
 
 from .config import AppConfig
-from .mcp_tools import mcp_map_website, mcp_scrape_batch
+from .mcp_tools import mcp_map_website, mcp_scrape_batch, mcp_scrape_url
 from .llm import create_llm, generate_summaries_batch
 from .critic import CriticResult
 from .deep_draft import (
