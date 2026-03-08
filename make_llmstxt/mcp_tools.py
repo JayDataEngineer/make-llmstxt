@@ -169,42 +169,43 @@ async def mcp_crawl_site(
     include_patterns: Optional[List[str]] = None,
     exclude_patterns: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Deep crawl a site using map_domain + scrape_url fallback.
-
-    Note: The MCP server's crawl_site tool has a server-side bug.
-    This function falls back to map_domain + scrape_url approach.
+    """Deep crawl a site following links using MCP crawl_site tool.
 
     Args:
         host: MCP server host
         port: MCP server port
         url: Starting URL to crawl
-        max_depth: Maximum depth to crawl (unused in fallback)
-        max_pages: Maximum pages to crawl
-        include_patterns: URL patterns to include (unused in fallback)
-        exclude_patterns: URL patterns to exclude (unused in fallback)
+        max_depth: Maximum depth to crawl (1-5)
+        max_pages: Maximum pages to crawl (1-200)
+        include_patterns: URL patterns to include
+        exclude_patterns: URL patterns to exclude
 
     Returns:
         List of crawled pages with content
     """
-    from urllib.parse import urlparse
+    client = create_mcp_client(host, port)
+    tools = await client.get_tools()
 
-    parsed = urlparse(url)
-    domain = parsed.netloc
+    crawl_site_tool = next((t for t in tools if t.name == "crawl_site"), None)
+    if not crawl_site_tool:
+        logger.error("[MCP] crawl_site tool not found")
+        return []
 
-    # Use map_domain to discover URLs
-    urls = await mcp_map_domain(host, port, domain, max_urls=max_pages)
+    args = {
+        "url": url,
+        "max_depth": max_depth,
+        "max_pages": max_pages,
+    }
+    if include_patterns:
+        args["include_patterns"] = include_patterns
+    if exclude_patterns:
+        args["exclude_patterns"] = exclude_patterns
 
-    if not urls:
-        logger.warning(f"[MCP] No URLs found for {domain}, trying to scrape the URL directly")
-        # Fall back to scraping just the provided URL
-        result = await mcp_scrape_url(host, port, url)
-        return [result] if result else []
+    result = await crawl_site_tool.ainvoke(args)
+    data = _extract_tool_result(result)
+    pages = data.get("pages", []) if isinstance(data, dict) else []
 
-    # Scrape the discovered URLs
-    logger.info(f"[MCP] Scraping {len(urls)} discovered URLs for {domain}")
-    pages = await mcp_scrape_batch(host, port, urls[:max_pages])
-
-    logger.info(f"[MCP] Scraped {len(pages)} pages from {domain}")
+    logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
     return pages
 
 
