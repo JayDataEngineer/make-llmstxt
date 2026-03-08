@@ -1,14 +1,16 @@
 """MCP Web Scraper - Connects to MCP research server for web scraping.
 
-Uses the MCP SSE protocol to connect to your MCP research server.
+Uses Streamable HTTP transport (MCP spec 2025-03-26) to connect to MCP server.
 Tools available:
 - search_web: Search the web
 - scrape_url: Scrape URL content (returns markdown)
+- map_domain: Discover URLs from a domain
+- crawl_site: Deep crawl a site following links
 - docs_list_sources: List llms.txt sources
 - docs_fetch_docs: Fetch docs from llms.txt source
 
-Configuration:
-- MCP_HOST: MCP server host (default: 100.85.22.99 - Tailscale)
+Configuration via environment:
+- MCP_HOST: MCP server host (default: 100.85.22.99)
 - MCP_PORT: MCP server port (default: 8000)
 """
 
@@ -34,7 +36,7 @@ class MCPConfig(BaseModel):
 
     host: str = MCP_HOST
     port: int = int(MCP_PORT)
-    timeout: float = 60.0
+    timeout: float = 120.0
 
     @property
     def base_url(self) -> str:
@@ -42,99 +44,64 @@ class MCPConfig(BaseModel):
 
 
 class MCPClient:
-    """Client for MCP server using SSE transport.
+    """Client for MCP server using Streamable HTTP transport.
 
-    The MCP SSE protocol:
-    1. Open persistent SSE connection to /sse
-    2. Receive session ID via "event: endpoint" event
-    3. Make POST requests to /messages/?session_id=XXX
-    4. Receive tool results via "event: message" on SSE connection
+    Streamable HTTP protocol (MCP spec 2025-03-26):
+    1. POST JSON-RPC requests to /mcp endpoint
+    2. Server responds with JSON or SSE stream
+    3. No persistent connection needed
     """
 
     def __init__(self, config: MCPConfig):
         self.config = config
         self.base_url = config.base_url
         self.timeout = config.timeout
-        self.session_id: Optional[str] = None
-        self.message_endpoint: Optional[str] = None
+        self.mcp_endpoint = f"{self.base_url}/mcp"
 
-        # HTTP clients
-        self._sse_client: Optional[httpx.AsyncClient] = None
+        # HTTP client
         self._http_client: Optional[httpx.AsyncClient] = None
 
-        # SSE state
-        self._sse_cm: Optional[Any] = None
-        self._sse_response: Optional[httpx.Response] = None
-        self._running = False
-        self._sse_task: Optional[asyncio.Task] = None
-
-        # Request tracking
-        self._pending_requests: Dict[int, asyncio.Future] = {}
+        # Session state
+        self._initialized = False
         self._request_counter = 1
 
-        # Tools cache
-        self._tools_cache: Optional[List[Dict[str, Any]]] = None
-
-    async def connect(self) -> bool:
-        """Connect to MCP server and establish SSE connection."""
-        try:
-            sse_url = f"{self.base_url}/sse"
-            logger.info(f"[MCP] Connecting to: {sse_url}")
-
-            self._sse_client = httpx.AsyncClient(timeout=None)
-            self._sse_cm = self._sse_client.stream("GET", sse_url)
-            self._sse_response = await self._sse_cm.__aenter__()
-            self._sse_response.raise_for_status()
-
-            # Start background SSE processor (handles both init and events)
-            self._running = True
-            self._connected = asyncio.Event()
-            self._sse_task = asyncio.create_task(self._process_sse_events())
-
-            # Wait for connection to be established (session received)
-            try:
-                await asyncio.wait_for(self._connected.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("[MCP] Timeout waiting for session")
-                self._running = False
-                await self._sse_cm.__aexit__(None, None, None)
-                return False
-
-            if not self.session_id:
-                logger.warning("[MCP] No session ID received")
-                self._running = False
-                await self._sse_cm.__aexit__(None, None, None)
-                return False
-
-            # MCP initialization handshake
-            logger.debug("[MCP] Sending initialize request...")
-            init_result = await self._call_jsonrpc("initialize", {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "make-llmstxt",
-                    "version": "0.1.0"
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client."""
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout, read=None),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
                 }
-            })
-            logger.debug(f"[MCP] Initialize result: {init_result}")
+            )
+        return self._http_client
 
-            # Send initialized notification
-            await self._send_notification("notifications/initialized")
-            logger.debug("[MCP] Sent initialized notification")
+    async def _ensure_initialized(self) -> None:
+        """Ensure MCP session is initialized."""
+        if self._initialized:
+            return
 
-            logger.info(f"[MCP] Connected: {self.session_id}")
-            return True
+        logger.debug("[MCP] Sending initialize request...")
+        init_result = await self._call_jsonrpc("initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "make-llmstxt",
+                "version": "0.1.0"
+            }
+        })
+        logger.debug(f"[MCP] Initialize result: {init_result}")
 
-        except Exception as e:
-            logger.error(f"[MCP] Connection failed: {e}")
-            return False
+        # Send initialized notification
+        await self._send_notification("notifications/initialized")
+        logger.debug("[MCP] Sent initialized notification")
+
+        self._initialized = True
 
     async def _send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         """Send a JSON-RPC notification (no response expected)."""
-        if not self.message_endpoint:
-            raise RuntimeError("Not connected. Call connect() first.")
-
-        client = await self._ensure_http_client()
+        client = await self._get_client()
 
         payload = {
             "jsonrpc": "2.0",
@@ -142,67 +109,13 @@ class MCPClient:
             "params": params or {}
         }
 
-        url = f"{self.base_url}{self.message_endpoint}"
         logger.debug(f"[MCP] POST notification {method}")
-
-        response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        response = await client.post(self.mcp_endpoint, json=payload)
         response.raise_for_status()
 
-    async def _process_sse_events(self):
-        """Process SSE events - handles both initial connection and subsequent messages."""
-        try:
-            event_type = None
-            async for line in self._sse_response.aiter_lines():
-                if not self._running:
-                    break
-
-                line = line.strip()
-                if not line:
-                    continue
-
-                if line.startswith("event:"):
-                    event_type = line[6:].strip()
-                elif line.startswith("data:"):
-                    data_str = line[5:].strip()
-
-                    # Handle initial endpoint event for session
-                    if event_type == "endpoint":
-                        self.message_endpoint = data_str
-                        if "session_id=" in data_str:
-                            self.session_id = data_str.split("session_id=")[1].split("&")[0]
-                        logger.info(f"[MCP] Session: {self.session_id}")
-                        self._connected.set()  # Signal that we're connected
-                        continue
-
-                    # Handle message events (tool results)
-                    if event_type == "message":
-                        try:
-                            data = json.loads(data_str)
-                            request_id = data.get("id")
-                            logger.debug(f"[MCP] SSE message id={request_id}: {str(data)[:200]}")
-
-                            if request_id is not None and request_id in self._pending_requests:
-                                future = self._pending_requests.pop(request_id)
-                                if not future.done():
-                                    future.set_result(data)
-                        except json.JSONDecodeError:
-                            logger.warning(f"[MCP] Failed to parse: {data_str[:100]}")
-
-        except Exception as e:
-            if self._running:
-                logger.error(f"[MCP] SSE error: {e}")
-
-    async def _ensure_http_client(self) -> httpx.AsyncClient:
-        if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=self.timeout)
-        return self._http_client
-
     async def _call_jsonrpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """Make JSON-RPC call via POST, receive result via SSE."""
-        if not self.message_endpoint:
-            raise RuntimeError("Not connected. Call connect() first.")
-
-        client = await self._ensure_http_client()
+        """Make JSON-RPC call via Streamable HTTP."""
+        client = await self._get_client()
 
         request_id = self._request_counter
         self._request_counter += 1
@@ -214,37 +127,61 @@ class MCPClient:
             "params": params or {}
         }
 
-        future: asyncio.Future = asyncio.Future()
-        self._pending_requests[request_id] = future
+        logger.debug(f"[MCP] POST {method} (id={request_id})")
 
-        url = f"{self.base_url}{self.message_endpoint}"
-        logger.debug(f"[MCP] POST {method}")
+        response = await client.post(self.mcp_endpoint, json=payload)
+        response.raise_for_status()
 
-        try:
-            response = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
-            response.raise_for_status()
-        except Exception as e:
-            self._pending_requests.pop(request_id, None)
-            raise
+        # Check content type to determine how to parse response
+        content_type = response.headers.get("content-type", "")
 
-        try:
-            result = await asyncio.wait_for(future, timeout=self.timeout)
-            return result.get("result", {})
-        except asyncio.TimeoutError:
-            self._pending_requests.pop(request_id, None)
-            raise RuntimeError(f"Timeout waiting for MCP response to {method}")
+        if "text/event-stream" in content_type:
+            # Parse SSE response
+            return await self._parse_sse_response(response)
+        else:
+            # Parse JSON response
+            data = response.json()
+            if "error" in data:
+                raise RuntimeError(f"MCP error: {data['error']}")
+            return data.get("result", {})
 
-    async def list_tools(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    async def _parse_sse_response(self, response: httpx.Response) -> Any:
+        """Parse SSE streaming response."""
+        text = response.text
+        result = None
+
+        # Parse SSE events
+        event_type = None
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                data_str = line[5:].strip()
+                try:
+                    data = json.loads(data_str)
+                    if "result" in data:
+                        result = data["result"]
+                    elif "error" in data:
+                        raise RuntimeError(f"MCP error: {data['error']}")
+                except json.JSONDecodeError:
+                    logger.warning(f"[MCP] Failed to parse SSE data: {data_str[:100]}")
+
+        return result
+
+    async def list_tools(self) -> List[Dict[str, Any]]:
         """List available tools."""
-        if self._tools_cache and not force_refresh:
-            return self._tools_cache
-
+        await self._ensure_initialized()
         result = await self._call_jsonrpc("tools/list")
-        self._tools_cache = result.get("tools", [])
-        return self._tools_cache
+        return result.get("tools", [])
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
+        await self._ensure_initialized()
+
         params = {"name": tool_name, "arguments": arguments}
         logger.info(f"[MCP] Calling: {tool_name}({list(arguments.keys())})")
 
@@ -262,40 +199,11 @@ class MCPClient:
         return result
 
     async def close(self):
-        """Close connections."""
-        self._running = False
-
-        for future in self._pending_requests.values():
-            if not future.done():
-                future.cancel()
-        self._pending_requests.clear()
-
-        if self._sse_task:
-            self._sse_task.cancel()
-            try:
-                await self._sse_task
-            except asyncio.CancelledError:
-                pass
-            self._sse_task = None
-
-        if self._sse_cm:
-            try:
-                await self._sse_cm.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self._sse_cm = None
-            self._sse_response = None
-
-        if self._sse_client:
-            await self._sse_client.aclose()
-            self._sse_client = None
-
+        """Close HTTP client."""
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
-
-        self.session_id = None
-        self.message_endpoint = None
+        self._initialized = False
 
 
 class MCPWebScraper:
@@ -305,6 +213,8 @@ class MCPWebScraper:
     - map_website: Discover URLs via sitemap or search
     - scrape_url: Scrape single URL to markdown
     - scrape_batch: Scrape multiple URLs concurrently
+    - map_domain: Discover URLs from a domain
+    - crawl_site: Deep crawl a site following links
     """
 
     def __init__(self, config: MCPConfig):
@@ -315,11 +225,8 @@ class MCPWebScraper:
     async def _get_client(self) -> MCPClient:
         """Get or create MCP client (thread-safe)."""
         async with self._client_lock:
-            if self._client is None or self._client.session_id is None:
+            if self._client is None:
                 self._client = MCPClient(self.config)
-                connected = await self._client.connect()
-                if not connected:
-                    raise RuntimeError("Failed to connect to MCP server")
         return self._client
 
     async def close(self):
@@ -388,8 +295,6 @@ class MCPWebScraper:
         Returns:
             List of scraped pages (excludes failures)
         """
-        import asyncio
-
         async def scrape_one(url: str) -> Optional[Dict[str, Any]]:
             return await self.scrape_url(url)
 
