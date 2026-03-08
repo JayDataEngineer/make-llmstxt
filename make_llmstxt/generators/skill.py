@@ -170,7 +170,7 @@ class SkillGenerator:
             supervisor = create_react_agent(
                 llm,
                 tools=[],  # Supervisor just plans, doesn't scrape
-                state_modifier=SUPERVISOR_PROMPT,
+                prompt=SUPERVISOR_PROMPT,
             )
 
             # Generator agent (Deep Agent with filesystem tools)
@@ -190,7 +190,7 @@ class SkillGenerator:
             critic = create_react_agent(
                 llm,
                 tools=[],  # Critic just reviews
-                state_modifier=CRITIC_PROMPT,
+                prompt=CRITIC_PROMPT,
             )
 
             if progress_callback:

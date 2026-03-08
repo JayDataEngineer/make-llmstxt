@@ -32,6 +32,7 @@ class GeneratorConfig(BaseModel):
 
     # LLM config
     model: str = Field(default="glm-4.5-air", description="Model identifier")
+    provider: str = Field(default="zai", description="LLM provider name")
     api_key: Optional[str] = Field(default=None, description="API key for LLM provider")
     base_url: Optional[str] = Field(default=None, description="Base URL for LLM API")
     temperature: float = Field(default=0.3, description="Generation temperature")
