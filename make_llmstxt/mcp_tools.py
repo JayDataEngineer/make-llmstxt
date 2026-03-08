@@ -128,7 +128,7 @@ async def mcp_map_domain(
         pattern: URL pattern filter
 
     Returns:
-        List of discovered URLs
+        List of discovered URL strings
     """
     client = create_mcp_client(host, port)
     tools = await client.get_tools()
@@ -146,7 +146,15 @@ async def mcp_map_domain(
     })
 
     data = _extract_tool_result(result)
-    urls = data.get("urls", []) if isinstance(data, dict) else []
+    raw_urls = data.get("urls", []) if isinstance(data, dict) else []
+
+    # Extract URL strings from [{"url": "..."}, ...] format
+    urls = []
+    for item in raw_urls:
+        if isinstance(item, dict) and "url" in item:
+            urls.append(item["url"])
+        elif isinstance(item, str):
+            urls.append(item)
 
     logger.info(f"[MCP] map_domain found {len(urls)} URLs for {domain}")
     return urls
@@ -161,45 +169,42 @@ async def mcp_crawl_site(
     include_patterns: Optional[List[str]] = None,
     exclude_patterns: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Deep crawl a site following links using MCP crawl_site tool.
+    """Deep crawl a site using map_domain + scrape_url fallback.
+
+    Note: The MCP server's crawl_site tool has a server-side bug.
+    This function falls back to map_domain + scrape_url approach.
 
     Args:
         host: MCP server host
         port: MCP server port
         url: Starting URL to crawl
-        max_depth: Maximum depth to crawl (1-5)
-        max_pages: Maximum pages to crawl (1-200)
-        include_patterns: URL patterns to include
-        exclude_patterns: URL patterns to exclude
+        max_depth: Maximum depth to crawl (unused in fallback)
+        max_pages: Maximum pages to crawl
+        include_patterns: URL patterns to include (unused in fallback)
+        exclude_patterns: URL patterns to exclude (unused in fallback)
 
     Returns:
         List of crawled pages with content
     """
-    client = create_mcp_client(host, port)
-    tools = await client.get_tools()
+    from urllib.parse import urlparse
 
-    # Find the crawl_site tool
-    crawl_site_tool = next((t for t in tools if t.name == "crawl_site"), None)
-    if not crawl_site_tool:
-        logger.error("[MCP] crawl_site tool not found")
-        return []
+    parsed = urlparse(url)
+    domain = parsed.netloc
 
-    args = {
-        "url": url,
-        "max_depth": max_depth,
-        "max_pages": max_pages,
-    }
-    if include_patterns:
-        args["include_patterns"] = include_patterns
-    if exclude_patterns:
-        args["exclude_patterns"] = exclude_patterns
+    # Use map_domain to discover URLs
+    urls = await mcp_map_domain(host, port, domain, max_urls=max_pages)
 
-    result = await crawl_site_tool.ainvoke(args)
+    if not urls:
+        logger.warning(f"[MCP] No URLs found for {domain}, trying to scrape the URL directly")
+        # Fall back to scraping just the provided URL
+        result = await mcp_scrape_url(host, port, url)
+        return [result] if result else []
 
-    data = _extract_tool_result(result)
-    pages = data.get("pages", []) if isinstance(data, dict) else []
+    # Scrape the discovered URLs
+    logger.info(f"[MCP] Scraping {len(urls)} discovered URLs for {domain}")
+    pages = await mcp_scrape_batch(host, port, urls[:max_pages])
 
-    logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
+    logger.info(f"[MCP] Scraped {len(pages)} pages from {domain}")
     return pages
 
 
