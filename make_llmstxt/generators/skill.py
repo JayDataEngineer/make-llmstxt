@@ -32,6 +32,7 @@ from make_llmstxt.mcp_tools import (
     MAIN_AGENT_TOOL_NAMES,
     SUBAGENT_TOOL_NAMES,
 )
+from deepagents.middleware.subagents import SubAgent
 
 
 # ==============================================================================
@@ -174,12 +175,19 @@ class SkillGenerator:
             )
 
             # Generator agent (Deep Agent with filesystem tools)
-            # Main agent gets map_domain and crawl_site for discovery
+            # Main agent gets map_domain, crawl_site, and scrape_url for discovery
             # Subagents only get scrape_url for individual page fetching
+            subagent_spec = SubAgent(
+                name="scraper",
+                description="Scrapes individual URLs to fetch documentation content.",
+                system_prompt="You are a documentation scraper. Use the scrape_url tool to fetch content from the given URL and return the markdown content.",
+                tools=subagent_tools,  # scrape_url only
+            )
+
             generator_agent = create_deep_agent(
                 model=llm,
-                tools=main_tools,  # map_domain, crawl_site for main agent
-                subagent_tools=subagent_tools,  # scrape_url only for subagents
+                tools=main_tools,  # map_domain, crawl_site, scrape_url for main agent
+                subagents=[subagent_spec],
                 system_prompt=GENERATOR_PROMPT.format(
                     output_dir=str(output_dir),
                     library_name=library_name,

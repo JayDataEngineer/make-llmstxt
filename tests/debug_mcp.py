@@ -1,40 +1,45 @@
 #!/usr/bin/env python3
-"""Debug MCP server responses."""
+"""Debug MCP server responses using langchain-mcp-adapters."""
 import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from make_llmstxt.mcp_scraper import MCPClient, MCPConfig
+from make_llmstxt.mcp_tools import create_mcp_client, mcp_scrape_url
 
 
 async def debug_mcp():
-    config = MCPConfig(host="100.102.244.97", port=8000)
-    client = MCPClient(config)
+    host = "100.102.244.97"
+    port = 8000
 
-    print("Connecting...")
-    connected = await client.connect()
-    print(f"Connected: {connected}")
-    print(f"Session: {client.session_id}")
+    print("Connecting via langchain-mcp-adapters...")
 
-    # List tools
-    print("\nListing tools...")
-    tools = await client.list_tools()
-    print(f"Available tools: {[t['name'] for t in tools]}")
+    # Create client and list tools
+    client = create_mcp_client(host, port)
+    tools = await client.get_tools()
+
+    print(f"Available tools: {[t.name for t in tools]}")
 
     # Test scrape_url
     print("\n--- Testing scrape_url ---")
-    result = await client.call_tool("scrape_url", {"url": "https://docs.python.org/3/"})
+    result = await mcp_scrape_url(host, port, "https://docs.python.org/3/")
     print(f"Result type: {type(result)}")
-    print(f"Result (first 500 chars): {str(result)[:500]}")
+    if result:
+        print(f"URL: {result.get('url')}")
+        print(f"Title: {result.get('title')}")
+        content = result.get('content', result.get('markdown', ''))
+        print(f"Content length: {len(content)}")
+        print(f"Content preview: {content[:500]}")
 
-    # Test search_web
+    # Test search_web via direct tool call
     print("\n--- Testing search_web ---")
-    result = await client.call_tool("search_web", {"query": "python documentation site:docs.python.org"})
-    print(f"Result type: {type(result)}")
-    print(f"Result (first 500 chars): {str(result)[:500]}")
-
-    await client.close()
+    search_tool = next((t for t in tools if t.name == "search_web"), None)
+    if search_tool:
+        result = await search_tool.ainvoke({"query": "python documentation site:docs.python.org"})
+        print(f"Result type: {type(result)}")
+        print(f"Result preview: {str(result)[:500]}")
+    else:
+        print("search_web tool not found")
 
 
 if __name__ == "__main__":

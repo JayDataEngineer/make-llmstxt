@@ -1,41 +1,48 @@
 #!/usr/bin/env python3
-"""Test what scrape_url returns."""
+"""Test what scrape_url returns using langchain-mcp-adapters."""
 import asyncio
 import json
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from make_llmstxt.mcp_scraper import MCPClient, MCPConfig
+from make_llmstxt.mcp_tools import create_mcp_client, mcp_scrape_url
 
 
 async def test_scrape():
-    config = MCPConfig(host="100.102.244.97", port=8000)
-    client = MCPClient(config)
+    host = "100.102.244.97"
+    port = 8000
 
-    print("Connecting...")
-    connected = await client.connect()
-    print(f"Connected: {connected}")
-    print(f"Session: {client.session_id}")
+    print("Testing scrape_url via langchain-mcp-adapters...")
 
     # Test scrape_url
     print("\n--- Testing scrape_url ---")
-    result = await client.call_tool("scrape_url", {"url": "https://docs.nextra.site"})
+    result = await mcp_scrape_url(host, port, "https://docs.nextra.site")
     print(f"Result type: {type(result)}")
 
-    # Parse the JSON if it's a JSON string
-    if isinstance(result, str):
-        print(f"Result is a string (length: {len(result)})")
-        try:
-            data = json.loads(result)
-            print(f"Parsed JSON: {json.dumps(data, indent=2)[:500]}")
-        except json.JSONDecodeError:
-            print(f"Not JSON, raw string (first 500): {result[:500]}")
+    if result:
+        print(f"URL: {result.get('url')}")
+        print(f"Title: {result.get('title')}")
+        content = result.get('content', result.get('markdown', ''))
+        print(f"Content length: {len(content)}")
+        print(f"Content preview (first 500): {content[:500]}")
     else:
-        print(f"Result (first 500): {str(result)[:500]}")
+        print("Result is None - scrape failed")
 
-    await client.close()
+
+async def test_get_tools():
+    host = "100.102.244.97"
+    port = 8000
+
+    print("\n--- Testing get_tools ---")
+    client = create_mcp_client(host, port)
+    tools = await client.get_tools()
+
+    print(f"Found {len(tools)} tools:")
+    for tool in tools:
+        print(f"  - {tool.name}: {tool.description[:100] if tool.description else 'No description'}...")
 
 
 if __name__ == "__main__":
     asyncio.run(test_scrape())
+    asyncio.run(test_get_tools())

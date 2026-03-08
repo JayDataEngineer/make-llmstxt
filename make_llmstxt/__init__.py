@@ -9,6 +9,7 @@ __version__ = "0.1.0"
 from .config import AppConfig, LLMConfig, MCPConfig, PROVIDER_PROFILES
 from .generator import generate_llmstxt, LLMsTxtGenerator, GenerationResult, PageResult
 from .mcp_tools import (
+    create_mcp_client,
     get_mcp_tools,
     filter_tools_by_name,
     MAIN_AGENT_TOOL_NAMES,
@@ -19,7 +20,6 @@ from .mcp_tools import (
     mcp_scrape_batch,
     mcp_map_website,
 )
-from .mcp_scraper import MCPWebScraper  # Backward compatibility
 from .critic import Critic, CriticResult
 from .deep_draft import (
     DeepDraftConfig,
@@ -38,7 +38,8 @@ __all__ = [
     "LLMsTxtGenerator",
     "GenerationResult",
     "PageResult",
-    # MCP tools (new)
+    # MCP tools
+    "create_mcp_client",
     "get_mcp_tools",
     "filter_tools_by_name",
     "MAIN_AGENT_TOOL_NAMES",
@@ -48,8 +49,6 @@ __all__ = [
     "mcp_scrape_url",
     "mcp_scrape_batch",
     "mcp_map_website",
-    # Backward compatibility
-    "MCPWebScraper",
     # Other
     "Critic",
     "CriticResult",
