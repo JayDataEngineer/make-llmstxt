@@ -62,56 +62,83 @@ class MCPClient:
         self._http_client: Optional[httpx.AsyncClient] = None
 
         # Session state
+        self._session_id: Optional[str] = None
         self._initialized = False
+        self._init_lock = asyncio.Lock()
         self._request_counter = 1
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._http_client is None:
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
+            # Add session ID header if we have one
+            if self._session_id:
+                headers["mcp-session-id"] = self._session_id
+
             self._http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.timeout, read=None),
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/event-stream",
-                }
+                headers=headers,
             )
+        elif self._session_id:
+            # Update headers on existing client
+            self._http_client.headers["mcp-session-id"] = self._session_id
+
         return self._http_client
 
     async def _ensure_initialized(self) -> None:
-        """Ensure MCP session is initialized."""
+        """Ensure MCP session is initialized (thread-safe)."""
         if self._initialized:
             return
 
-        logger.debug("[MCP] Sending initialize request...")
-        init_result = await self._call_jsonrpc("initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "make-llmstxt",
-                "version": "0.1.0"
-            }
-        })
-        logger.debug(f"[MCP] Initialize result: {init_result}")
+        async with self._init_lock:
+            # Double-check after acquiring lock
+            if self._initialized:
+                return
 
-        # Send initialized notification
-        await self._send_notification("notifications/initialized")
-        logger.debug("[MCP] Sent initialized notification")
+            logger.debug("[MCP] Sending initialize request...")
+            init_result = await self._call_jsonrpc("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "make-llmstxt",
+                    "version": "0.1.0"
+                }
+            })
+            logger.debug(f"[MCP] Initialize result: {init_result}")
 
-        self._initialized = True
+            # Send initialized notification
+            await self._send_notification("notifications/initialized")
+            logger.debug("[MCP] Sent initialized notification")
+
+            self._initialized = True
 
     async def _send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
-        """Send a JSON-RPC notification (no response expected)."""
+        """Send a JSON-RPC notification (no response expected).
+
+        Note: Notifications in Streamable HTTP may return 202 or 400 depending
+        on server implementation. We don't raise on non-2xx for notifications.
+        """
         client = await self._get_client()
 
         payload = {
             "jsonrpc": "2.0",
             "method": method,
-            "params": params or {}
         }
+        if params:
+            payload["params"] = params
 
         logger.debug(f"[MCP] POST notification {method}")
-        response = await client.post(self.mcp_endpoint, json=payload)
-        response.raise_for_status()
+        try:
+            response = await client.post(self.mcp_endpoint, json=payload)
+            # Don't raise_for_status - notifications may return various codes
+            if response.status_code >= 400:
+                logger.debug(f"[MCP] Notification {method} returned {response.status_code}")
+        except Exception as e:
+            # Notifications are fire-and-forget, don't fail on errors
+            logger.debug(f"[MCP] Notification {method} error: {e}")
 
     async def _call_jsonrpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
         """Make JSON-RPC call via Streamable HTTP."""
@@ -130,7 +157,18 @@ class MCPClient:
         logger.debug(f"[MCP] POST {method} (id={request_id})")
 
         response = await client.post(self.mcp_endpoint, json=payload)
+
+        # Debug: log response for non-2xx
+        if response.status_code >= 400:
+            logger.debug(f"[MCP] Error response ({response.status_code}): {response.text[:500]}")
+
         response.raise_for_status()
+
+        # Capture session ID from response header (Streamable HTTP)
+        session_id = response.headers.get("mcp-session-id")
+        if session_id and not self._session_id:
+            self._session_id = session_id
+            logger.debug(f"[MCP] Session ID: {session_id}")
 
         # Check content type to determine how to parse response
         content_type = response.headers.get("content-type", "")
