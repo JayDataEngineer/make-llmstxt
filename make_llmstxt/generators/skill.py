@@ -271,23 +271,7 @@ Create the folder structure:
                     },
                 )
             else:
-                logger.warning(f"[SkillGenerator] SKILL.md not created, checking graph output")
-                # Fallback: extract content from last message
-                final_message = result.get("messages", [])[-1] if result.get("messages") else None
-                if final_message:
-                    content = final_message.content if hasattr(final_message, 'content') else str(final_message)
-                    # Write the content anyway
-                    skill_dir.mkdir(parents=True, exist_ok=True)
-                    skill_file.write_text(content)
-                    logger.info(f"[SkillGenerator] Wrote fallback SKILL.md")
-
-                return GeneratorResult(
-                    output_path=skill_file,
-                    stats={
-                        "output_dir": str(skill_dir),
-                        "fallback": True,
-                    },
-                )
+                raise RuntimeError(f"Skill generation failed: SKILL.md was not created at {skill_dir}")
 
     async def close(self):
         """Clean up resources."""

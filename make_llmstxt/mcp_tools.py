@@ -250,20 +250,9 @@ async def mcp_scrape_url(
                 },
             }
         else:
-            logger.warning(f"[MCP] Scrape failed for {url}: {data.get('error', 'Unknown error')}")
-            return None
-    elif isinstance(data, str):
-        # Fallback: treat as raw markdown
-        return {
-            "url": url,
-            "title": "",
-            "content": data,
-            "markdown": data,
-            "metadata": {},
-        }
+            raise RuntimeError(f"MCP scrape_url failed for {url}: {data.get('error', 'Unknown error')}")
     else:
-        logger.warning(f"[MCP] Unexpected scrape_url result type: {type(data)}")
-        return None
+        raise RuntimeError(f"MCP scrape_url returned unexpected type: {type(data)}")
 
 
 async def mcp_scrape_batch(
