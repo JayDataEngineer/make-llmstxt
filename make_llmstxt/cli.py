@@ -44,20 +44,21 @@ def list_providers():
 
 def handle_skill(args):
     """Handle skill generation with hierarchical LangGraph."""
-    # Setup config for skill generator
+    # Load env config first
+    env_config = AppConfig.from_env()
+
     # Read max_rounds from env or use CLI default
     max_rounds = args.max_rounds or int(os.getenv("SKILL_MAX_ROUNDS", "3"))
 
     skill_config = GeneratorConfig(
         url=args.url,
         output_dir=Path(args.output_dir),
-        mcp_host=args.mcp_host,
-        mcp_port=int(args.mcp_port),
+        mcp_host=env_config.mcp.host,
+        mcp_port=env_config.mcp.port,
         max_rounds=max_rounds,
     )
 
     # Override LLM settings from env
-    env_config = AppConfig.from_env()
     skill_config.api_key = env_config.llm.api_key
     skill_config.base_url = env_config.llm.base_url
     skill_config.model = env_config.llm.model
@@ -82,7 +83,7 @@ def handle_skill(args):
     console.print(f"\n[bold cyan]Starting skill generation for {args.url}...[/bold cyan]")
     console.print(f"Provider: {skill_config.provider}")
     console.print(f"Model: {skill_config.model}")
-    console.print(f"MCP: {args.mcp_host}:{args.mcp_port}")
+    console.print(f"MCP: {skill_config.mcp_host}:{skill_config.mcp_port}")
     console.print()
 
     with Progress(
@@ -168,8 +169,6 @@ def main():
     llmstxt_parser.add_argument("--model", "-m", help="Model name to use")
     llmstxt_parser.add_argument("--base-url", help="Base URL for LLM API")
     llmstxt_parser.add_argument("--api-key", help="API key for LLM provider")
-    llmstxt_parser.add_argument("--mcp-host", default="100.85.22.99", help="MCP server host")
-    llmstxt_parser.add_argument("--mcp-port", default="8000", help="MCP server port")
     llmstxt_parser.add_argument("--no-full-text", action="store_true", help="Don't generate llms-full.txt")
     llmstxt_parser.add_argument("--no-critic", action="store_true", help="Disable critic validation")
     llmstxt_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum draft-critic rounds")
@@ -190,8 +189,6 @@ def main():
     skill_parser.add_argument("--model", "-m", help="Model name to use")
     skill_parser.add_argument("--base-url", help="Base URL for LLM API")
     skill_parser.add_argument("--api-key", help="API key for LLM provider")
-    skill_parser.add_argument("--mcp-host", default="100.85.22.99", help="MCP server host")
-    skill_parser.add_argument("--mcp-port", default="8000", help="MCP server port")
     skill_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum critic revision rounds (default: 3)")
     skill_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     skill_parser.add_argument("--log-file", help="Path to log file")
@@ -228,11 +225,7 @@ def main():
     # Build configuration
     config = AppConfig.from_env()
     logger.debug(f"Loaded config from env: provider={config.llm.provider}")
-
-    # Configure MCP scraper
-    config.mcp.host = args.mcp_host
-    config.mcp.port = int(args.mcp_port)
-    logger.info(f"Using MCP scraper at {args.mcp_host}:{args.mcp_port}")
+    logger.info(f"Using MCP scraper at {config.mcp.host}:{config.mcp.port}")
 
     # Override LLM settings with command line args
     if args.provider:
