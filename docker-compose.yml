@@ -1,0 +1,28 @@
+# llama.cpp Docker Compose
+# Docs: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+
+services:
+  llama-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: llama-server
+    ports:
+      - "${LLAMA_PORT:-8001}:8001"
+    volumes:
+      - ${LLM_MODEL_PATH}:/models/llm.gguf:ro
+      - ${EMBED_MODEL_PATH}:/models/embed.gguf:ro
+      - ./docker/preset.ini:/app/preset.ini:ro
+    environment:
+      # Model instances inherit these env vars from router
+      LLAMA_ARG_PORT: 8001
+      LLAMA_ARG_HOST: 0.0.0.0
+      # Chat template for thinking mode (Qwen3.5)
+      LLAMA_ARG_CHAT_TEMPLATE_KWARGS: '{"enable_thinking":true}'
+    command: --models-preset /app/preset.ini
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
