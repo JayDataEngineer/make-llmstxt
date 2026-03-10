@@ -44,10 +44,21 @@ class MCPConfig(BaseModel):
     host: str = Field(default="100.85.22.99", description="MCP server host")
     port: int = Field(default=8000, description="MCP server port")
     timeout: float = Field(default=60.0, description="Request timeout in seconds")
+    # Full URL override (e.g., for Tailscale Funnel)
+    url: Optional[str] = Field(default=None, description="Full MCP URL (overrides host/port)")
 
     @property
     def base_url(self) -> str:
+        if self.url:
+            return self.url
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def mcp_endpoint(self) -> str:
+        """Get the MCP endpoint URL."""
+        if self.url:
+            return self.url if self.url.endswith('/mcp') else f"{self.url}/mcp"
+        return f"http://{self.host}:{self.port}/mcp"
 
 
 class AppConfig(BaseModel):
@@ -96,6 +107,7 @@ class AppConfig(BaseModel):
         # MCP config
         config.mcp.host = os.getenv("MCP_HOST", "100.85.22.99")
         config.mcp.port = int(os.getenv("MCP_PORT", "8000"))
+        config.mcp.url = os.getenv("MCP_URL")  # Full URL override (e.g., Tailscale Funnel)
 
         return config
 

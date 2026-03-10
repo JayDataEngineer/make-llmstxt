@@ -43,28 +43,30 @@ def filter_tools_by_name(tools: List, tool_names: Set[str]) -> List:
 # MCP Client Creation
 # ==============================================================================
 
-def create_mcp_client(host: str, port: int) -> MultiServerMCPClient:
+def create_mcp_client(host: str, port: int, url: Optional[str] = None) -> MultiServerMCPClient:
     """Create MCP client for webtools server.
 
     Args:
         host: MCP server host
         port: MCP server port
+        url: Full MCP URL (overrides host/port, e.g., for Tailscale Funnel)
 
     Returns:
         MultiServerMCPClient instance
     """
+    mcp_url = url if url else f"http://{host}:{port}/mcp"
     return MultiServerMCPClient(
         {
             "webtools": {
                 "transport": "http",
-                "url": f"http://{host}:{port}/mcp",
+                "url": mcp_url,
             }
         }
     )
 
 
 @asynccontextmanager
-async def get_mcp_tools(host: str, port: int, max_urls: Optional[int] = None):
+async def get_mcp_tools(host: str, port: int, url: Optional[str] = None, max_urls: Optional[int] = None):
     """Context manager to connect to MCP server and get LangChain tools.
 
     Usage:
@@ -72,7 +74,7 @@ async def get_mcp_tools(host: str, port: int, max_urls: Optional[int] = None):
             main_tools = filter_tools_by_name(tools, MAIN_AGENT_TOOL_NAMES)
             subagent_tools = filter_tools_by_name(tools, SUBAGENT_TOOL_NAMES)
     """
-    client = create_mcp_client(host, port)
+    client = create_mcp_client(host, port, url)
 
     # Use session for stateful connection during graph execution
     async with client.session("webtools") as session:
@@ -112,12 +114,12 @@ def _extract_tool_result(result: Any) -> Any:
     return result
 
 
-async def _call_mcp_tool(host: str, port: int, tool_name: str, args: dict) -> Any:
+async def _call_mcp_tool(host: str, port: int, tool_name: str, args: dict, url: Optional[str] = None) -> Any:
     """Helper to call an MCP tool and return extracted result.
 
     Reduces boilerplate in mcp_* functions.
     """
-    client = create_mcp_client(host, port)
+    client = create_mcp_client(host, port, url)
     tools = await client.get_tools()
     tool = next((t for t in tools if t.name == tool_name), None)
     if not tool:
@@ -132,13 +134,14 @@ async def mcp_map_domain(
     domain: str,
     max_urls: Optional[int] = None,
     pattern: str = "*",
+    mcp_url: Optional[str] = None,
 ) -> List[str]:
     """Discover URLs from a domain using MCP map_domain tool."""
     data = await _call_mcp_tool(host, port, "map_domain", {
         "domain": domain,
         "max_urls": max_urls,
         "pattern": pattern,
-    })
+    }, url=mcp_url)
 
     raw_urls = data.get("urls", []) if isinstance(data, dict) else []
 
@@ -162,6 +165,7 @@ async def mcp_crawl_site(
     max_pages: int = 50,
     include_patterns: Optional[List[str]] = None,
     exclude_patterns: Optional[List[str]] = None,
+    mcp_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Deep crawl a site following links using MCP crawl_site tool.
 
@@ -173,6 +177,7 @@ async def mcp_crawl_site(
         max_pages: Maximum pages to crawl (1-200)
         include_patterns: URL patterns to include
         exclude_patterns: URL patterns to exclude
+        mcp_url: Full MCP URL override (e.g., for Tailscale Funnel)
 
     Returns:
         List of crawled pages with content
@@ -187,7 +192,7 @@ async def mcp_crawl_site(
     if exclude_patterns:
         args["exclude_patterns"] = exclude_patterns
 
-    data = await _call_mcp_tool(host, port, "crawl_site", args)
+    data = await _call_mcp_tool(host, port, "crawl_site", args, url=mcp_url)
     pages = data.get("pages", []) if isinstance(data, dict) else []
 
     logger.info(f"[MCP] crawl_site found {len(pages)} pages from {url}")
@@ -198,6 +203,7 @@ async def mcp_scrape_url(
     host: str,
     port: int,
     url: str,
+    mcp_url: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Scrape a single URL using MCP scrape_url tool.
 
@@ -205,11 +211,12 @@ async def mcp_scrape_url(
         host: MCP server host
         port: MCP server port
         url: URL to scrape
+        mcp_url: Full MCP URL override (e.g., for Tailscale Funnel)
 
     Returns:
         Dict with url, title, content, metadata or raises on failure
     """
-    data = await _call_mcp_tool(host, port, "scrape_url", {"url": url})
+    data = await _call_mcp_tool(host, port, "scrape_url", {"url": url}, url=mcp_url)
 
     if not isinstance(data, dict):
         raise RuntimeError(f"MCP scrape_url returned unexpected type: {type(data)}")
@@ -234,6 +241,7 @@ async def mcp_scrape_batch(
     port: int,
     urls: List[str],
     max_concurrent: int = 3,
+    mcp_url: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Scrape multiple URLs with limited concurrency.
 
@@ -242,6 +250,7 @@ async def mcp_scrape_batch(
         port: MCP server port
         urls: URLs to scrape
         max_concurrent: Maximum concurrent scrapes (default 3)
+        mcp_url: Full MCP URL override (e.g., for Tailscale Funnel)
 
     Returns:
         List of scraped pages (excludes failures)
@@ -252,7 +261,7 @@ async def mcp_scrape_batch(
 
     async def scrape_one(url: str) -> Optional[Dict[str, Any]]:
         async with semaphore:
-            return await mcp_scrape_url(host, port, url)
+            return await mcp_scrape_url(host, port, url, mcp_url=mcp_url)
 
     tasks = [scrape_one(url) for url in urls]
     results = await asyncio.gather(*tasks)
@@ -265,6 +274,7 @@ async def mcp_map_website(
     port: int,
     url: str,
     limit: Optional[int] = None,
+    mcp_url: Optional[str] = None,
 ) -> List[str]:
     """Map website to get URLs (compatibility function).
 
@@ -275,6 +285,7 @@ async def mcp_map_website(
         port: MCP server port
         url: Website URL
         limit: Maximum URLs to return
+        mcp_url: Full MCP URL override (e.g., for Tailscale Funnel)
 
     Returns:
         List of discovered URLs
@@ -289,6 +300,7 @@ async def mcp_map_website(
         port,
         domain,
         max_urls=limit or 999999,
+        mcp_url=mcp_url,
     )
 
     logger.info(f"[MCP] map_website found {len(urls)} URLs for {url}")
