@@ -373,13 +373,25 @@ class SkillGenerator:
             if progress_callback:
                 progress_callback("Building agents...", 30)
 
-            # Create LLM
-            llm = ChatOpenAI(
+            # Create base LLM (no thinking - for subagents)
+            llm_base = ChatOpenAI(
                 model=self.config.model,
                 temperature=self.config.temperature,
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
             )
+
+            # Create LLM with thinking enabled (for deep agents - generator and critic)
+            # Qwen3.5 thinking mode settings for coding tasks
+            llm_thinking = llm_base.bind(
+                temperature=0.6,  # Precise coding tasks
+                extra_body={
+                    "top_k": 20,
+                    "min_p": 0.0,
+                    "chat_template_kwargs": {"enable_thinking": True}
+                }
+            )
+            logger.info("[SkillGenerator] Thinking mode ENABLED for deep agents (generator, critic)")
 
             # Generator Deep Agent
             subagent_spec = SubAgent(
@@ -392,7 +404,7 @@ class SkillGenerator:
             generator_fs_backend = FilesystemBackend(root_dir=str(output_dir))
 
             generator_agent = create_deep_agent(
-                model=llm,
+                model=llm_thinking,  # Use thinking LLM for generator
                 tools=main_tools,
                 subagents=[subagent_spec],
                 system_prompt=GENERATOR_PROMPT.format(
@@ -407,7 +419,7 @@ class SkillGenerator:
             critic_fs_backend = FilesystemBackend(root_dir=str(output_dir))
 
             critic_agent = create_deep_agent(
-                model=llm,
+                model=llm_thinking,  # Use thinking LLM for critic
                 tools=main_tools,  # Web tools to verify against source
                 system_prompt=CRITIC_PROMPT.format(
                     llmstxt_content=llmstxt_content,
