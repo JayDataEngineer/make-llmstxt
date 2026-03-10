@@ -62,6 +62,10 @@ class GeneratorConfig(BaseModel):
     max_concurrent: int = Field(default=5, description="Max concurrent scraper workers")
     max_content_per_doc: Optional[int] = Field(default=None, description="Max chars per scraped doc (None = no limit)")
 
+    # Fast LLM for parallel summarization (cheaper model for Stage 1 summaries)
+    fast_model: str = Field(default="gpt-4o-mini", description="Fast model for summarization")
+    fast_model_temperature: float = Field(default=0.1, description="Temperature for fast model")
+
     class Config:
         arbitrary_types_allowed = True  # Allow AgentPrompts dataclass
 

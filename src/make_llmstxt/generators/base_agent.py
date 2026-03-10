@@ -6,8 +6,10 @@ with different prompts injected via configuration.
 
 import time
 import asyncio
+import hashlib
 import json
 import re
+from datetime import datetime
 from typing import List, Dict, Any, TypedDict, Optional, Callable, Annotated
 import operator
 from pathlib import Path
@@ -16,9 +18,11 @@ from urllib.parse import urlparse
 from loguru import logger
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send
+from langgraph.store.base import BaseStore
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.middleware.subagents import SubAgent
@@ -30,6 +34,7 @@ from ..scrapers import (
     MAIN_AGENT_TOOL_NAMES,
     SUBAGENT_TOOL_NAMES,
 )
+from .schemas import PageSummary
 
 
 # ==============================================================================
@@ -503,7 +508,9 @@ class DeepAgentGenerator:
         1. Discovery - agent runs map_domain to discover URLs
         2. Router - fans out to parallel scraper workers
         3. Scraper workers - each scrapes one URL (runs in parallel)
-        4. Synthesis - LLM generates output from scraped docs
+           - Stores full content (Phase 3: will use BaseStore)
+           - Generates structured summary for state
+        4. Synthesis - LLM generates output from scraped summaries
         5. Critic - validates output
         """
         max_concurrent = self.config.max_concurrent or 5
@@ -512,6 +519,15 @@ class DeepAgentGenerator:
 
         # Semaphore for explicit concurrency limiting
         semaphore = asyncio.Semaphore(max_concurrent)
+
+        # Fast LLM for structured summarization (cheaper model)
+        fast_llm = ChatOpenAI(
+            model=self.config.fast_model,
+            temperature=self.config.fast_model_temperature,
+            api_key=self.config.api_key,
+            base_url=self.config.base_url,
+        )
+        structured_llm = fast_llm.with_structured_output(PageSummary)
 
         # Bind static methods for use in nested functions
         extract_urls = self._extract_urls_from_messages
@@ -574,10 +590,17 @@ class DeepAgentGenerator:
                 for url in urls
             ]
 
-        async def scraper_node(state: dict) -> dict:
-            """Scrape a single URL. Runs in parallel via Send with semaphore limiting."""
+        async def scraper_node(state: dict, config: RunnableConfig) -> dict:
+            """Scrape a single URL, store full content, return structured summary.
+
+            Runs in parallel via Send with semaphore limiting.
+            Stage 1 of two-stage pipeline: small summaries in state, full content persists.
+            """
             url = state["url"]
             max_c = state.get("max_content")
+
+            # Get store from config (if available)
+            store: Optional[BaseStore] = config.get("configurable", {}).get("store")
 
             # Use semaphore to limit concurrent scrapers
             async with semaphore:
@@ -586,15 +609,42 @@ class DeepAgentGenerator:
                     result = await scrape_tool.ainvoke({"url": url})
 
                     # Parse result and extract content
-                    content = parse_result(result)
+                    full_content = parse_result(result)
 
-                    # Truncate if configured
-                    if max_c and len(content) > max_c:
-                        content = content[:max_c] + "\n... (truncated)"
-                        logger.debug(f"{log_prefix} Truncated {url} to {max_c} chars")
+                    # ACTION 1: Store FULL content in BaseStore (persists across runs)
+                    if store:
+                        # Use URL + content prefix for deduplication (handles content changes)
+                        content_hash = hashlib.md5(f"{url}:{full_content[:1000]}".encode()).hexdigest()
 
-                    logger.info(f"{log_prefix} Scraped {url} ({len(content)} chars)")
-                    return {"scraped_docs": [{"url": url, "content": content}]}
+                        await store.aput(
+                            namespace=("memories", "raw_pages"),
+                            key=content_hash,
+                            value={
+                                "url": url,
+                                "content": full_content,
+                                "scraped_at": datetime.now().isoformat(),
+                            }
+                        )
+                        logger.debug(f"{log_prefix} Stored {url} in BaseStore (key={content_hash[:8]}...)")
+
+                    # Truncate for LLM if configured (for summary generation)
+                    content_for_llm = full_content
+                    if max_c and len(full_content) > max_c:
+                        content_for_llm = full_content[:max_c]
+                        logger.debug(f"{log_prefix} Truncated {url} to {max_c} chars for summary")
+
+                    # ACTION 2: Generate structured summary (tiny footprint for state)
+                    summary: PageSummary = await structured_llm.ainvoke(
+                        f"Analyze this documentation page.\n\n"
+                        f"URL: {url}\n\n"
+                        f"Content:\n{content_for_llm[:15000]}"
+                    )
+
+                    # Ensure URL is set correctly (in case LLM makes mistakes)
+                    summary.url = url
+
+                    logger.info(f"{log_prefix} Scraped {url} → {summary.title} ({len(full_content)} chars)")
+                    return {"scraped_docs": [summary.model_dump()]}
 
                 except Exception as e:
                     logger.error(f"{log_prefix} Failed to scrape {url}: {e}")
@@ -685,11 +735,11 @@ class DeepAgentGenerator:
 
     def _format_synthesis_message(self, context: str, output_path: Path) -> str:
         """Format the synthesis prompt. Override in subclasses for customization."""
-        return f"""Generate the output file based on the scraped content below.
+        return f"""Generate the output file based on the scraped page summaries below.
 
 Output file: {output_path}
 
-Scraped content:
+Scraped page summaries:
 ---
 {context}
 ---
@@ -772,15 +822,27 @@ Use write_file to create the output file with the appropriate content."""
 
     @staticmethod
     def _format_scraped_docs_for_synthesis(docs: List[Dict], errors: List[str]) -> str:
-        """Format scraped docs for the synthesis LLM."""
+        """Format scraped docs for the synthesis LLM.
+
+        Works with PageSummary format (url, title, description, key_topics).
+        This creates a compact representation for synthesis without context explosion.
+        """
         parts = []
 
         if docs:
-            parts.append(f"=== {len(docs)} Scraped Pages ===\n")
+            parts.append(f"=== {len(docs)} Scraped Pages (Summaries) ===\n")
             for i, doc in enumerate(docs, 1):
                 url = doc.get("url", "unknown")
-                content = doc.get("content", "")
-                parts.append(f"--- Page {i}: {url} ---\n{content}\n")
+                title = doc.get("title", "Untitled")
+                description = doc.get("description", "No description")
+                topics = doc.get("key_topics", [])
+                topics_str = ", ".join(topics) if topics else "N/A"
+                parts.append(
+                    f"--- Page {i}: {title} ---\n"
+                    f"URL: {url}\n"
+                    f"Description: {description}\n"
+                    f"Topics: {topics_str}\n"
+                )
 
         if errors:
             parts.append(f"\n=== {len(errors)} Failed Pages ===\n")
