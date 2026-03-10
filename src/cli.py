@@ -19,6 +19,7 @@ import asyncio
 
 from .config import AppConfig, LLMConfig, PROVIDER_PROFILES
 from .generators.llmstxt import generate_llmstxt
+from .generators.llmstxt_agent import LLMsTxtAgentGenerator
 from .generators.skill import SkillGenerator
 from .__init__ import __version__
 from .utils.logging import setup_logging
@@ -222,6 +223,7 @@ def main():
     llmstxt_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     llmstxt_parser.add_argument("--log-file", help="Path to log file")
     llmstxt_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")
+    llmstxt_parser.add_argument("--agent", action="store_true", help="Use Deep Agent pattern (generator → critic loop)")
 
     # ========== skill mode ==========
     skill_parser = subparsers.add_parser(
@@ -299,41 +301,97 @@ def main():
 
     # Run llms.txt generation
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
+        # Check if using agent mode
+        use_agent = getattr(args, 'agent', False)
 
-            task_id = None
+        if use_agent:
+            # Use Deep Agent pattern
+            console.print("[cyan]Using Deep Agent pattern for generation[/cyan]")
 
-            def progress_callback(stage, current, total, message):
-                nonlocal task_id
-                logger.debug(f"Progress: {stage} - {current}/{total} - {message}")
-                if stage == "mapping":
-                    if task_id is None:
-                        task_id = progress.add_task(message, total=total)
-                    progress.update(task_id, description=message, completed=current)
-                elif stage == "scraping":
-                    if task_id is None:
-                        task_id = progress.add_task(message, total=total)
-                    progress.update(task_id, description=message, completed=current)
-
-            logger.info(f"Starting generation for {args.url}")
-            result = asyncio.run(
-                generate_llmstxt(
-                    args.url,
-                    config=config,
-                    max_urls=args.max_urls,
-                    output_dir=Path(args.output_dir),
-                    progress_callback=progress_callback,
-                    enable_critic=not args.no_critic,
-                    max_retries=args.max_rounds,
-                    pass_threshold=args.pass_threshold,
-                )
+            agent_config = GeneratorConfig(
+                url=args.url,
+                output_dir=Path(args.output_dir),
+                mcp_host=config.mcp.host,
+                mcp_port=config.mcp.port,
+                max_rounds=args.max_rounds,
+                pass_threshold=args.pass_threshold,
             )
+            agent_config.api_key = config.llm.api_key
+            agent_config.base_url = config.llm.base_url
+            agent_config.model = config.llm.model
+            agent_config.provider = config.llm.provider
+            agent_config.max_urls = args.max_urls
+
+            generator = LLMsTxtAgentGenerator(agent_config)
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                task_id = progress.add_task("Generating llms.txt...", total=None)
+
+                def agent_progress_callback(message, percent):
+                    progress.update(task_id, description=message)
+
+                result = asyncio.run(
+                    generator.generate(
+                        args.url,
+                        output_file=Path(args.output_dir) / "llms.txt",
+                        progress_callback=agent_progress_callback,
+                    )
+                )
+
+            console.print()
+            console.print(f"[green]Success![/green] Generated llms.txt")
+            console.print(f"Output: {result.output_path}")
+            console.print(f"Critic passed: {result.stats.get('critic_passed', False)}")
+            console.print(f"Rounds: {result.stats.get('rounds', 0)}")
+            logger.info(f"Agent generation complete: {result.output_path}")
+
+        else:
+            # Use traditional batch pattern
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+
+                task_id = None
+
+                def progress_callback(stage, current, total, message):
+                    nonlocal task_id
+                    logger.debug(f"Progress: {stage} - {current}/{total} - {message}")
+                    if stage == "mapping":
+                        if task_id is None:
+                            task_id = progress.add_task(message, total=total)
+                        progress.update(task_id, description=message, completed=current)
+                    elif stage == "scraping":
+                        if task_id is None:
+                            task_id = progress.add_task(message, total=total)
+                        progress.update(task_id, description=message, completed=current)
+
+                logger.info(f"Starting generation for {args.url}")
+                result = asyncio.run(
+                    generate_llmstxt(
+                        args.url,
+                        config=config,
+                        max_urls=args.max_urls,
+                        output_dir=Path(args.output_dir),
+                        progress_callback=progress_callback,
+                        enable_critic=not args.no_critic,
+                        max_retries=args.max_rounds,
+                        pass_threshold=args.pass_threshold,
+                    )
+                )
+
+            # Print summary
+            console.print()
+            console.print(f"[green]Success![/green] Processed {result.num_urls_processed} out of {result.num_urls_total} URLs")
+            console.print(f"Files saved to {args.output_dir}/")
+            logger.info(f"Generation complete: {result.num_urls_processed}/{result.num_urls_total} URLs processed")
 
         # Print summary
         console.print()
