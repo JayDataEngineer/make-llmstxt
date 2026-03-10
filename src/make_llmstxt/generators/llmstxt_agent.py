@@ -118,6 +118,50 @@ Remember:
 
 
 # ==============================================================================
+# Message Cleaning (for Qwen/llama.cpp compatibility)
+# ==============================================================================
+
+def clean_messages(messages: List[Any]) -> List[Any]:
+    """Merge consecutive assistant messages into one.
+
+    Some LLM APIs (like Qwen/llama.cpp) don't allow consecutive assistant messages.
+    This function merges them by concatenating their content.
+    """
+    if not messages:
+        return messages
+
+    cleaned = []
+    for msg in messages:
+        # Handle both dict format and LangChain message objects
+        if isinstance(msg, dict):
+            msg_type = msg.get("role", "unknown")
+            msg_content = msg.get("content", "")
+        else:
+            msg_type = getattr(msg, "type", None) or getattr(msg, "role", "unknown")
+            msg_content = getattr(msg, "content", "")
+
+        # Check if we need to merge with previous message
+        if cleaned:
+            prev_msg = cleaned[-1]
+            if isinstance(prev_msg, dict):
+                prev_type = prev_msg.get("role", "unknown")
+            else:
+                prev_type = getattr(prev_msg, "type", None) or getattr(prev_msg, "role", "unknown")
+
+            # Merge consecutive assistant messages
+            if prev_type == "assistant" and msg_type == "assistant":
+                if isinstance(prev_msg, dict):
+                    prev_msg["content"] = f"{prev_msg.get('content', '')}\n{msg_content}"
+                else:
+                    prev_msg.content = f"{prev_msg.content}\n{msg_content}"
+                continue
+
+        cleaned.append(msg)
+
+    return cleaned
+
+
+# ==============================================================================
 # State Definition
 # ==============================================================================
 
@@ -374,6 +418,10 @@ class LLMsTxtAgentGenerator:
                     messages = state.get("messages", [])
                     messages = list(messages) + [{"role": "user", "content": feedback_msg}]
 
+                    # Clean messages to avoid consecutive assistant messages (Qwen/llama.cpp fix)
+                    messages = clean_messages(messages)
+                    logger.debug(f"[LLMsTxtAgent] Cleaned messages: {len(messages)} messages")
+
                     return {
                         **state,
                         "messages": messages,
@@ -391,9 +439,20 @@ class LLMsTxtAgentGenerator:
                     "critic_feedback": [],
                 }
 
+            # Generator wrapper that cleans messages before running
+            async def generator_node(state: dict) -> dict:
+                """Run generator with message cleaning for Qwen/llama.cpp compatibility."""
+                messages = state.get("messages", [])
+                cleaned = clean_messages(messages)
+                if len(cleaned) != len(messages):
+                    logger.debug(f"[LLMsTxtAgent] Generator: cleaned {len(messages)} -> {len(cleaned)} messages")
+                # Call the actual generator agent with cleaned messages
+                result = await generator_agent.ainvoke({**state, "messages": cleaned})
+                return result
+
             # Build graph
             graph = StateGraph(LLMsTxtState)
-            graph.add_node("generator", generator_agent)
+            graph.add_node("generator", generator_node)
             graph.add_node("critic", critic_node)
 
             graph.set_entry_point("generator")
