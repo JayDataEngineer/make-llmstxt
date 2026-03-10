@@ -1,4 +1,5 @@
 {
+  "$comment": "Store config for LangGraph Cloud deployments. For local dev, pass embeddings directly to Store.",
   "store": {
     "index": {
       "embed": "openai:text-embedding-3-small",

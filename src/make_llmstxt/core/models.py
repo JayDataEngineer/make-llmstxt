@@ -66,6 +66,20 @@ class GeneratorConfig(BaseModel):
     fast_model: str = Field(default="gpt-4o-mini", description="Fast model for summarization")
     fast_model_temperature: float = Field(default=0.1, description="Temperature for fast model")
 
+    # Local embeddings config (for Store semantic search)
+    embedding_base_url: Optional[str] = Field(
+        default=None,
+        description="Base URL for embedding API (e.g., http://localhost:8080/v1 for llama.cpp)"
+    )
+    embedding_model: str = Field(
+        default="embed",
+        description="Model name for embeddings (matches [embed] section in llama.cpp preset)"
+    )
+    embedding_dims: int = Field(
+        default=768,
+        description="Embedding dimensions (768 for nomic-embed-text, 1536 for OpenAI)"
+    )
+
     class Config:
         arbitrary_types_allowed = True  # Allow AgentPrompts dataclass
 

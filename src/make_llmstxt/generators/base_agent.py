@@ -34,6 +34,7 @@ from ..scrapers import (
     MAIN_AGENT_TOOL_NAMES,
     SUBAGENT_TOOL_NAMES,
 )
+from ..store import get_store_from_config
 from .schemas import PageSummary
 
 
@@ -353,11 +354,23 @@ class DeepAgentGenerator:
                 logger.info(f"{self.log_prefix} Using SERIAL scraping (conversational)")
                 graph = self._build_graph(generator_agent, llm, output_path, url)
 
+            # Create store for full content persistence (optional)
+            store = get_store_from_config(self.config)
+
             # Run the graph
             initial_message = self._format_initial_message(url, output_path)
             logger.info(f"{self.log_prefix} Running generator → critic loop...")
 
             logging_handler = DeepAgentLoggingHandler(self.log_prefix)
+
+            # Build config with store (if available)
+            invoke_config = {
+                "callbacks": [logging_handler],
+                "configurable": {},
+            }
+            if store:
+                invoke_config["configurable"]["store"] = store
+                logger.info(f"{self.log_prefix} Store enabled for content persistence")
 
             result = await graph.ainvoke(
                 {
@@ -376,7 +389,7 @@ class DeepAgentGenerator:
                     "scraping_errors": [],
                     "scraping_complete": False,
                 },
-                config={"callbacks": [logging_handler]}
+                config=invoke_config
             )
 
             if progress_callback:
