@@ -612,16 +612,13 @@ class DeepAgentGenerator:
             """Scrape a single URL, store full content, return structured summary.
 
             Runs in parallel via Send with semaphore limiting.
-            Stage 1 of two-stage pipeline: small summaries in state, full content persists.
-
-            Content is stored WITHOUT embeddings (index=False) for later batch embedding.
-            Run `make-llmstxt embed` with embedding server for Stage 1.5.
+            Full content is stored with auto-generated embeddings for semantic search.
             """
             url = state["url"]
             max_c = state.get("max_content")
 
             # Get store from config (if available)
-            store: Optional[EmbedLaterStore] = config.get("configurable", {}).get("store")
+            store = config.get("configurable", {}).get("store")
 
             # Use semaphore to limit concurrent scrapers
             async with semaphore:
