@@ -1,0 +1,38 @@
+{
+  "memories/raw_pages/test1": {
+    "key": "test1",
+    "namespace": [
+      "memories",
+      "raw_pages"
+    ],
+    "embedded": true,
+    "stored_at": "2026-03-10T16:53:03.635182"
+  },
+  "memories/raw_pages/rate-limits": {
+    "key": "rate-limits",
+    "namespace": [
+      "memories",
+      "raw_pages"
+    ],
+    "embedded": true,
+    "stored_at": "2026-03-10T16:53:17.138164"
+  },
+  "memories/raw_pages/webhooks": {
+    "key": "webhooks",
+    "namespace": [
+      "memories",
+      "raw_pages"
+    ],
+    "embedded": true,
+    "stored_at": "2026-03-10T16:53:17.501849"
+  },
+  "memories/raw_pages/batch": {
+    "key": "batch",
+    "namespace": [
+      "memories",
+      "raw_pages"
+    ],
+    "embedded": true,
+    "stored_at": "2026-03-10T16:53:17.524734"
+  }
+}

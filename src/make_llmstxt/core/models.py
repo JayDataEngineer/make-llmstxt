@@ -67,17 +67,18 @@ class GeneratorConfig(BaseModel):
     fast_model_temperature: float = Field(default=0.1, description="Temperature for fast model")
 
     # Local embeddings config (for Store semantic search)
+    # In router mode, use same base_url as chat, different model name
     embedding_base_url: Optional[str] = Field(
         default=None,
-        description="Base URL for embedding API (e.g., http://localhost:8080/v1 for llama.cpp)"
+        description="Base URL for embedding API. In router mode, use same as base_url"
     )
     embedding_model: str = Field(
         default="embed",
-        description="Model name for embeddings (matches [embed] section in llama.cpp preset)"
+        description="Model name for embeddings (router mode: use model name from preset)"
     )
     embedding_dims: int = Field(
-        default=768,
-        description="Embedding dimensions (768 for nomic-embed-text, 1536 for OpenAI)"
+        default=1024,
+        description="Embedding dimensions (1024 for jina-v5-small)"
     )
 
     class Config:
