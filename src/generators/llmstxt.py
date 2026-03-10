@@ -229,6 +229,7 @@ class LLMsTxtGenerator:
         url: str,
         max_urls: Optional[int],
         progress_callback: Optional[Callable] = None,
+        feedback: Optional[List[str]] = None,
     ) -> tuple[List[PageResult], str]:
         """Scrape website and return page results and source content.
 
@@ -236,6 +237,7 @@ class LLMsTxtGenerator:
             url: Website URL
             max_urls: Maximum URLs to scrape (None = unlimited)
             progress_callback: Progress callback
+            feedback: Optional critic feedback to improve summaries
 
         Returns:
             Tuple of (list_of_page_results, source_content_string)
@@ -270,7 +272,7 @@ class LLMsTxtGenerator:
                     f"Processing batch {batch_num}/{total_batches} ({len(batch)} URLs)",
                 )
 
-            results = await self.process_batch(batch, start_index=i)
+            results = await self.process_batch(batch, start_index=i, feedback=feedback)
             all_results.extend(results)
 
             # Small delay between batches
@@ -354,12 +356,14 @@ class LLMsTxtGenerator:
             if round_num < max_retries and critique.issues:
                 logger.info(f"[Critic] Regenerating summaries with feedback...")
                 feedback = critique.issues + critique.suggestions
+                logger.debug(f"[Critic] Feedback: {feedback}")
 
                 # Re-scrape with feedback (only pages that had issues)
                 current_pages, _ = await self._scrape_website(
                     url=url,
                     max_urls=len(pages),
                     progress_callback=None,
+                    feedback=feedback,
                 )
 
                 current_llmstxt = self._format_llmstxt(url, current_pages)

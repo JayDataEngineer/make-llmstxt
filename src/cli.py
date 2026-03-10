@@ -23,6 +23,7 @@ from .generators.skill import SkillGenerator
 from .__init__ import __version__
 from .utils.logging import setup_logging
 from .core import GeneratorConfig
+from .validators import validate_skill_generation
 
 console = Console()
 
@@ -46,6 +47,38 @@ def handle_skill(args):
     """Handle skill generation with hierarchical LangGraph."""
     # Load env config first
     env_config = AppConfig.from_env()
+
+    # Run validation if requested or if clean is specified
+    if args.validate or args.clean:
+        library_name = args.url.split("//")[-1].split("/")[0].replace("www.", "").replace("docs.", "").split(".")[0]
+        output_subdir = Path(args.output_dir) / library_name
+
+        validation_result = validate_skill_generation(
+            output_dir=output_subdir,
+            mcp_host=env_config.mcp.host,
+            mcp_port=env_config.mcp.port,
+            llm_base_url=env_config.llm.base_url,
+            auto_fix=args.clean,
+        )
+
+        # Print validation results
+        if validation_result.fixes_applied:
+            for fix in validation_result.fixes_applied:
+                console.print(f"[green]✓ {fix}[/green]")
+
+        if validation_result.warnings:
+            for warning in validation_result.warnings:
+                console.print(f"[yellow]⚠ {warning}[/yellow]")
+
+        if validation_result.errors:
+            for error in validation_result.errors:
+                console.print(f"[red]✗ {error}[/red]")
+            if not args.clean:
+                console.print("[dim]Run with --clean to automatically fix issues[/dim]")
+            sys.exit(1)
+
+        if args.validate and validation_result.valid:
+            console.print("[green]✓ All validation checks passed[/green]")
 
     # Read max_rounds from env or use CLI default
     max_rounds = args.max_rounds or int(os.getenv("SKILL_MAX_ROUNDS", "3"))
@@ -205,6 +238,8 @@ def main():
     skill_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     skill_parser.add_argument("--log-file", help="Path to log file")
     skill_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")
+    skill_parser.add_argument("--clean", action="store_true", help="Clean output directory before generation")
+    skill_parser.add_argument("--validate", action="store_true", help="Run validation checks before generation")
 
     # Parse arguments
     args = parser.parse_args()
