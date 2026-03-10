@@ -57,6 +57,11 @@ class GeneratorConfig(BaseModel):
     prompts: Optional[AgentPrompts] = Field(default=None, description="Prompts for Deep Agent")
     context: Dict[str, Any] = Field(default_factory=dict, description="Additional context for prompts")
 
+    # Parallel scraping config (Map-Reduce pattern)
+    enable_parallel: bool = Field(default=True, description="Use parallel scraping with Send")
+    max_concurrent: int = Field(default=5, description="Max concurrent scraper workers")
+    max_content_per_doc: Optional[int] = Field(default=None, description="Max chars per scraped doc (None = no limit)")
+
     class Config:
         arbitrary_types_allowed = True  # Allow AgentPrompts dataclass
 

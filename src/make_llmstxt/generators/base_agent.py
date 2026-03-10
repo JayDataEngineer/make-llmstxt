@@ -5,7 +5,11 @@ with different prompts injected via configuration.
 """
 
 import time
-from typing import List, Dict, Any, TypedDict, Optional, Callable
+import asyncio
+import json
+import re
+from typing import List, Dict, Any, TypedDict, Optional, Callable, Annotated
+import operator
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,6 +18,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
+from langgraph.types import Send
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.middleware.subagents import SubAgent
@@ -177,9 +182,9 @@ class DeepAgentLoggingHandler(BaseCallbackHandler):
 # ==============================================================================
 
 class DeepAgentState(TypedDict):
-    """Shared state for Deep Agent graph.
+    """Base state for Deep Agent graph.
 
-    Used by both llms.txt and skill generators.
+    Generic state used by all generators. Keep this clean - no domain-specific fields.
     """
     messages: List[Any]
     url: str
@@ -189,8 +194,21 @@ class DeepAgentState(TypedDict):
     critic_passed: bool
     critic_score: float
     critic_feedback: List[str]
-    # Additional context (llms.txt content for skill generation)
+    # Generic context for task-specific data
     context: Dict[str, Any]
+
+
+class WebScrapingState(DeepAgentState):
+    """Specialized state for web scraping agents (Map-Reduce pattern).
+
+    Extends DeepAgentState with parallel scraping fields. Use this
+    only in generators that do web scraping (e.g., LLMsTxtGenerator).
+    """
+    # Parallel scraping state
+    discovered_urls: List[str]  # URLs from map_domain
+    scraped_docs: Annotated[List[Dict], operator.add]  # Parallel-safe accumulator
+    scraping_errors: Annotated[List[str], operator.add]  # Failed URLs
+    scraping_complete: bool  # Flag to indicate all scrapers finished
 
 
 # ==============================================================================
@@ -316,8 +334,19 @@ class DeepAgentGenerator:
             if progress_callback:
                 progress_callback("Running generator → critic loop...", 20)
 
-            # Build the graph
-            graph = self._build_graph(generator_agent, llm, output_path, url)
+            # Build the appropriate graph based on config
+            if self.config.enable_parallel:
+                logger.info(f"{self.log_prefix} Using PARALLEL scraping (max_concurrent={self.config.max_concurrent})")
+                # Get scrape tool for parallel workers
+                scrape_tool = filter_tools_by_name(all_tools, ["scrape_url"])[0] if filter_tools_by_name(all_tools, ["scrape_url"]) else None
+                if scrape_tool:
+                    graph = self._build_parallel_graph(generator_agent, llm, output_path, url, scrape_tool)
+                else:
+                    logger.warning(f"{self.log_prefix} scrape_url tool not found, falling back to serial mode")
+                    graph = self._build_graph(generator_agent, llm, output_path, url)
+            else:
+                logger.info(f"{self.log_prefix} Using SERIAL scraping (conversational)")
+                graph = self._build_graph(generator_agent, llm, output_path, url)
 
             # Run the graph
             initial_message = self._format_initial_message(url, output_path)
@@ -336,6 +365,11 @@ class DeepAgentGenerator:
                     "critic_score": 0.0,
                     "critic_feedback": [],
                     "context": self.config.context,
+                    # Parallel scraping state
+                    "discovered_urls": [],
+                    "scraped_docs": [],
+                    "scraping_errors": [],
+                    "scraping_complete": False,
                 },
                 config={"callbacks": [logging_handler]}
             )
@@ -454,6 +488,306 @@ class DeepAgentGenerator:
         graph.add_edge("generator", "critic")
         graph.add_conditional_edges("critic", should_continue)
         return graph.compile()
+
+    def _build_parallel_graph(
+        self,
+        generator_agent,
+        llm: ChatOpenAI,
+        output_path: Path,
+        url: str,
+        scrape_tool,
+    ) -> StateGraph:
+        """Build graph with parallel scraping via Send (Map-Reduce pattern).
+
+        Flow:
+        1. Discovery - agent runs map_domain to discover URLs
+        2. Router - fans out to parallel scraper workers
+        3. Scraper workers - each scrapes one URL (runs in parallel)
+        4. Synthesis - LLM generates output from scraped docs
+        5. Critic - validates output
+        """
+        max_concurrent = self.config.max_concurrent or 5
+        max_content = self.config.max_content_per_doc
+        log_prefix = self.log_prefix
+
+        # Semaphore for explicit concurrency limiting
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        # Bind static methods for use in nested functions
+        extract_urls = self._extract_urls_from_messages
+        parse_result = self._parse_scrape_result
+        format_docs = self._format_scraped_docs_for_synthesis
+
+        def should_continue(state: dict) -> str:
+            current_round = state.get("current_round", 0)
+            max_rounds = state.get("max_rounds", 3)
+
+            if current_round >= max_rounds:
+                logger.warning(f"{log_prefix} Max rounds ({max_rounds}) reached")
+                return END
+
+            critic_passed = state.get("critic_passed", False)
+            if critic_passed:
+                logger.info(f"{log_prefix} Critic APPROVED")
+                return END
+
+            return "discovery"
+
+        async def discovery_node(state: dict) -> dict:
+            """Run generator to discover URLs via map_domain."""
+            messages = state.get("messages", [])
+            cleaned = clean_messages(messages)
+            result = await generator_agent.ainvoke({**state, "messages": cleaned})
+
+            # Extract URLs from tool responses
+            urls = extract_urls(result.get("messages", []))
+
+            # Apply max_urls limit
+            max_urls = self.config.max_urls
+            if max_urls and len(urls) > max_urls:
+                logger.info(f"{log_prefix} Limiting URLs from {len(urls)} to {max_urls}")
+                urls = urls[:max_urls]
+
+            logger.info(f"{log_prefix} Discovered {len(urls)} URLs for parallel scraping")
+
+            return {
+                **result,
+                "discovered_urls": urls,
+                "scraped_docs": [],
+                "scraping_errors": [],
+            }
+
+        def router_node(state: dict) -> List[Send]:
+            """Fan out to parallel scraper workers."""
+            urls = state.get("discovered_urls", [])
+            if not urls:
+                logger.warning(f"{log_prefix} No URLs discovered, skipping scraping")
+                return []
+
+            logger.info(f"{log_prefix} Fanning out to {len(urls)} scraper workers")
+            return [
+                Send("scraper", {
+                    "url": url,
+                    "output_path": state.get("output_path", ""),
+                    "max_content": max_content,
+                })
+                for url in urls
+            ]
+
+        async def scraper_node(state: dict) -> dict:
+            """Scrape a single URL. Runs in parallel via Send with semaphore limiting."""
+            url = state["url"]
+            max_c = state.get("max_content")
+
+            # Use semaphore to limit concurrent scrapers
+            async with semaphore:
+                try:
+                    logger.debug(f"{log_prefix} Scraping: {url}")
+                    result = await scrape_tool.ainvoke({"url": url})
+
+                    # Parse result and extract content
+                    content = parse_result(result)
+
+                    # Truncate if configured
+                    if max_c and len(content) > max_c:
+                        content = content[:max_c] + "\n... (truncated)"
+                        logger.debug(f"{log_prefix} Truncated {url} to {max_c} chars")
+
+                    logger.info(f"{log_prefix} Scraped {url} ({len(content)} chars)")
+                    return {"scraped_docs": [{"url": url, "content": content}]}
+
+                except Exception as e:
+                    logger.error(f"{log_prefix} Failed to scrape {url}: {e}")
+                    return {"scraping_errors": [f"{url}: {str(e)}"]}
+
+        async def synthesis_node(state: dict) -> dict:
+            """Generate final output from scraped docs."""
+            docs = state.get("scraped_docs", [])
+            errors = state.get("scraping_errors", [])
+
+            logger.info(f"{log_prefix} Synthesis: {len(docs)} docs, {len(errors)} errors")
+
+            # Format scraped content for LLM
+            context = format_docs(docs, errors)
+
+            # Create synthesis prompt
+            synthesis_message = self._format_synthesis_message(context, output_path)
+
+            # Run generator with synthesis context
+            messages = state.get("messages", [])
+            messages = list(messages) + [{"role": "user", "content": synthesis_message}]
+            messages = clean_messages(messages)
+
+            result = await generator_agent.ainvoke({**state, "messages": messages})
+            return result
+
+        async def critic_node(state: dict) -> dict:
+            """Run critic on the generated output."""
+            current_round = state.get("current_round", 0) + 1
+
+            passed, score, feedback = await self._run_critic(
+                state, output_path, url, current_round
+            )
+
+            logger.info(
+                f"{log_prefix} Critic round {current_round}: "
+                f"passed={passed}, score={score:.2f}, issues={len(feedback)}"
+            )
+
+            if not passed:
+                feedback_msg = self._format_feedback_message(feedback)
+                messages = state.get("messages", [])
+                messages = list(messages) + [{"role": "user", "content": feedback_msg}]
+                messages = clean_messages(messages)
+
+                return {
+                    **state,
+                    "messages": messages,
+                    "current_round": current_round,
+                    "critic_passed": False,
+                    "critic_score": score,
+                    "critic_feedback": feedback,
+                    # Reset for next round
+                    "discovered_urls": [],
+                    "scraped_docs": [],
+                    "scraping_errors": [],
+                }
+
+            return {
+                **state,
+                "current_round": current_round,
+                "critic_passed": True,
+                "critic_score": score,
+                "critic_feedback": [],
+            }
+
+        # Build graph with specialized state for web scraping
+        graph = StateGraph(WebScrapingState)
+        graph.add_node("discovery", discovery_node)
+        graph.add_node("router", router_node)
+        graph.add_node("scraper", scraper_node)
+        graph.add_node("synthesis", synthesis_node)
+        graph.add_node("critic", critic_node)
+
+        # Wire up the flow
+        graph.set_entry_point("discovery")
+        # If URLs discovered, go to router (which fans out), else skip to synthesis
+        graph.add_conditional_edges(
+            "discovery",
+            lambda s: "router" if s.get("discovered_urls") else "synthesis"
+        )
+        # router fans out to scrapers via Send (handled automatically by returning List[Send])
+        graph.add_edge("scraper", "synthesis")  # All scrapers converge to synthesis
+        graph.add_edge("synthesis", "critic")
+        graph.add_conditional_edges("critic", should_continue)
+
+        return graph.compile()
+
+    def _format_synthesis_message(self, context: str, output_path: Path) -> str:
+        """Format the synthesis prompt. Override in subclasses for customization."""
+        return f"""Generate the output file based on the scraped content below.
+
+Output file: {output_path}
+
+Scraped content:
+---
+{context}
+---
+
+Use write_file to create the output file with the appropriate content."""
+
+    # ==============================================================================
+    # Helper functions for parallel scraping
+    # ==============================================================================
+
+    @staticmethod
+    def _extract_urls_from_messages(messages: List[Any]) -> List[str]:
+        """Extract URLs from tool responses (map_domain results)."""
+        urls = []
+        for msg in messages:
+            # Handle dict format
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+            else:
+                content = getattr(msg, "content", "")
+
+            if not content:
+                continue
+
+            # Try to parse as JSON (map_domain returns JSON)
+            try:
+                if isinstance(content, str) and content.startswith("["):
+                    data = json.loads(content)
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and "url" in item:
+                                urls.append(item["url"])
+                            elif isinstance(item, str) and item.startswith("http"):
+                                urls.append(item)
+                elif isinstance(content, str) and '"urls"' in content:
+                    # Handle nested format: {"urls": [...]}
+                    data = json.loads(content)
+                    if "urls" in data:
+                        for item in data["urls"]:
+                            if isinstance(item, dict) and "url" in item:
+                                urls.append(item["url"])
+            except (json.JSONDecodeError, TypeError):
+                # Fallback: regex for URLs
+                found = re.findall(r'https?://[^\s"<>\]]+', content)
+                urls.extend(found)
+
+        # Dedupe while preserving order
+        seen = set()
+        unique = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                unique.append(u)
+        return unique
+
+    @staticmethod
+    def _parse_scrape_result(result: Any) -> str:
+        """Parse scrape tool result to extract content."""
+        if isinstance(result, str):
+            # Try to parse JSON
+            try:
+                data = json.loads(result)
+                if isinstance(data, dict):
+                    return data.get("content", "") or data.get("markdown", "") or result
+            except json.JSONDecodeError:
+                return result
+        elif isinstance(result, dict):
+            return result.get("content", "") or result.get("markdown", "") or str(result)
+        elif isinstance(result, list) and result:
+            # Handle list format from MCP tools
+            first = result[0]
+            if isinstance(first, dict) and "text" in first:
+                text = first["text"]
+                try:
+                    data = json.loads(text)
+                    return data.get("content", "") or data.get("markdown", "") or text
+                except json.JSONDecodeError:
+                    return text
+        return str(result)
+
+    @staticmethod
+    def _format_scraped_docs_for_synthesis(docs: List[Dict], errors: List[str]) -> str:
+        """Format scraped docs for the synthesis LLM."""
+        parts = []
+
+        if docs:
+            parts.append(f"=== {len(docs)} Scraped Pages ===\n")
+            for i, doc in enumerate(docs, 1):
+                url = doc.get("url", "unknown")
+                content = doc.get("content", "")
+                parts.append(f"--- Page {i}: {url} ---\n{content}\n")
+
+        if errors:
+            parts.append(f"\n=== {len(errors)} Failed Pages ===\n")
+            for err in errors:
+                parts.append(f"- {err}\n")
+
+        return "\n".join(parts)
 
     async def _run_critic(
         self,
