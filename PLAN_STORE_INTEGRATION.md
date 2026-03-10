@@ -201,7 +201,13 @@ async def search_docs(query: str, runtime) -> str:
 - [x] Add `langgraph.json` with index config
 - [x] Implement store access via config (using LangGraph native store)
 - [x] Update scraper_node with `store.aput()`
-- [ ] Test persistence across runs
+- [x] Test persistence across runs
+
+### Phase 3.5: Batch Embedding (VRAM-Efficient)
+- [x] Create EmbedLaterStore with index=False support
+- [x] Create batch embed CLI command (`make-llmstxt embed`)
+- [x] Update scraper_node to use embed-later mode
+- [x] Add local embeddings support for llama.cpp router mode
 
 ### Phase 4: Search Tool
 - [x] Create `search_docs` tool
@@ -222,6 +228,30 @@ async def search_docs(query: str, runtime) -> str:
 | Summary max words | 50 words description | Tiny footprint for 70+ pages |
 | Search limit | 5 results | Balance breadth vs context |
 | Embedding model | `text-embedding-3-small` | Good quality, low cost |
+| **Embed-later mode** | `index=False` during scrape | Enables batch embedding with separate server |
+| **Batch embedding** | Separate CLI command | VRAM-efficient: chat model and embed model never coexist |
+
+---
+
+## Workflow: VRAM-Efficient Batch Embedding
+
+For systems with limited VRAM that want to use large embedding models:
+
+```bash
+# Stage 1: Scrape with chat model (content stored without embeddings)
+llama-server --model qwen-14b.gguf --port 8080
+make-llmstxt llmstxt https://docs.example.com
+
+# Stage 1.5: Spin down chat, spin up embedding server
+# (now you have 100% VRAM for the embedding model)
+llama-server --model qwen-embed-8b.gguf --embedding --port 8081
+make-llmstxt embed --base-url http://localhost:8081/v1 --model qwen-embed --dims 4096
+
+# Stage 2: Spin up chat server again
+# Semantic search now works on embedded content
+llama-server --model qwen-14b.gguf --port 8080
+make-llmstxt skill https://docs.example.com
+```
 
 ---
 
@@ -229,6 +259,8 @@ async def search_docs(query: str, runtime) -> str:
 
 - [ ] Parallel scraping runs without context explosion
 - [ ] Full content persists in Store across restarts
+- [x] Store supports embed-later mode (index=False)
+- [x] Batch embed CLI command works
 - [ ] Semantic search retrieves relevant chunks
 - [ ] Stage 2 agent can find specific code examples
 - [ ] Deduplication works (same URL doesn't duplicate)
