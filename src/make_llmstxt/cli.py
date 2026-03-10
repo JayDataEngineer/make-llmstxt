@@ -17,10 +17,12 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 import asyncio
 
-from .config import AppConfig, LLMConfig, PROVIDER_PROFILES
+from .config import AppConfig, PROVIDER_PROFILES
 from .generators.llmstxt import generate_llmstxt
 from .generators.llmstxt_agent import LLMsTxtAgentGenerator
 from .generators.skill import SkillGenerator
+from .generators.prompts.llmstxt import LLMSTXT_PROMPTS
+from .generators.prompts.skill import SKILL_PROMPTS
 from .__init__ import __version__
 from .utils.logging import setup_logging
 from .core import GeneratorConfig
@@ -45,7 +47,7 @@ def list_providers():
 
 
 def handle_skill(args):
-    """Handle skill generation with hierarchical LangGraph."""
+    """Handle skill generation with Deep Agent."""
     # Load env config first
     env_config = AppConfig.from_env()
 
@@ -84,40 +86,40 @@ def handle_skill(args):
     # Read max_rounds from env or use CLI default
     max_rounds = args.max_rounds or int(os.getenv("SKILL_MAX_ROUNDS", "3"))
 
-    skill_config = GeneratorConfig(
+    # Build unified config
+    config = GeneratorConfig(
         url=args.url,
         output_dir=Path(args.output_dir),
         mcp_host=env_config.mcp.host,
         mcp_port=env_config.mcp.port,
         max_rounds=max_rounds,
+        api_key=env_config.llm.api_key,
+        base_url=env_config.llm.base_url,
+        model=env_config.llm.model,
+        provider=env_config.llm.provider,
+        prompts=SKILL_PROMPTS,
     )
-
-    # Override LLM settings from env
-    skill_config.api_key = env_config.llm.api_key
-    skill_config.base_url = env_config.llm.base_url
-    skill_config.model = env_config.llm.model
-    skill_config.provider = env_config.llm.provider
 
     # Override with CLI args
     if args.provider:
-        skill_config.provider = args.provider
+        config.provider = args.provider
         if args.provider in PROVIDER_PROFILES:
             profile = PROVIDER_PROFILES[args.provider]
-            skill_config.model = args.model or profile["default_model"]
+            config.model = args.model or profile["default_model"]
     if args.model:
-        skill_config.model = args.model
+        config.model = args.model
     if args.base_url:
-        skill_config.base_url = args.base_url
+        config.base_url = args.base_url
     if args.api_key:
-        skill_config.api_key = args.api_key
+        config.api_key = args.api_key
 
     # Create skill generator
-    generator = SkillGenerator(skill_config)
+    generator = SkillGenerator(config)
 
     console.print(f"\n[bold cyan]Starting skill generation for {args.url}...[/bold cyan]")
-    console.print(f"Provider: {skill_config.provider}")
-    console.print(f"Model: {skill_config.model}")
-    console.print(f"MCP: {skill_config.mcp_host}:{skill_config.mcp_port}")
+    console.print(f"Provider: {config.provider}")
+    console.print(f"Model: {config.model}")
+    console.print(f"MCP: {config.mcp_host}:{config.mcp_port}")
     console.print()
 
     with Progress(
@@ -128,17 +130,11 @@ def handle_skill(args):
         task_id = progress.add_task("Initializing...", total=None)
 
         def progress_callback(*args):
-            """Handle progress updates with flexible signature.
-
-            LLMsTxtGenerator calls with 4 args: (stage, current, total, message)
-            SkillGenerator calls with 2 args: (message, percent)
-            """
+            """Handle progress updates with flexible signature."""
             nonlocal task_id
             if len(args) == 4:
-                # LLMsTxtGenerator format: (stage, current, total, message)
                 message = args[3]
             elif len(args) == 2:
-                # SkillGenerator format: (message, percent)
                 message = args[0]
             else:
                 message = str(args[0]) if args else ""
@@ -166,9 +162,6 @@ def handle_skill(args):
             if args.verbose:
                 console.print_exception()
             sys.exit(1)
-
-        finally:
-            asyncio.run(generator.close())
 
 
 def main():
@@ -228,7 +221,7 @@ def main():
     # ========== skill mode ==========
     skill_parser = subparsers.add_parser(
         "skill",
-        help="Generate a skill package (SKILL.md, scripts/, references/) using hierarchical LangGraph",
+        help="Generate a skill package (SKILL.md, scripts/, references/) using Deep Agent",
     )
     skill_parser.add_argument("url", help="Library/framework documentation URL")
     skill_parser.add_argument("--output-dir", "-o", default=".", help="Output directory for skill package")
@@ -315,12 +308,13 @@ def main():
                 mcp_port=config.mcp.port,
                 max_rounds=args.max_rounds,
                 pass_threshold=args.pass_threshold,
+                api_key=config.llm.api_key,
+                base_url=config.llm.base_url,
+                model=config.llm.model,
+                provider=config.llm.provider,
+                max_urls=args.max_urls,
+                prompts=LLMSTXT_PROMPTS,
             )
-            agent_config.api_key = config.llm.api_key
-            agent_config.base_url = config.llm.base_url
-            agent_config.model = config.llm.model
-            agent_config.provider = config.llm.provider
-            agent_config.max_urls = args.max_urls
 
             generator = LLMsTxtAgentGenerator(agent_config)
 
@@ -392,12 +386,6 @@ def main():
             console.print(f"[green]Success![/green] Processed {result.num_urls_processed} out of {result.num_urls_total} URLs")
             console.print(f"Files saved to {args.output_dir}/")
             logger.info(f"Generation complete: {result.num_urls_processed}/{result.num_urls_total} URLs processed")
-
-        # Print summary
-        console.print()
-        console.print(f"[green]Success![/green] Processed {result.num_urls_processed} out of {result.num_urls_total} URLs")
-        console.print(f"Files saved to {args.output_dir}/")
-        logger.info(f"Generation complete: {result.num_urls_processed}/{result.num_urls_total} URLs processed")
 
     except Exception as e:
         logger.exception(f"Generation failed: {e}")

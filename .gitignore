@@ -74,6 +74,7 @@ pip-delete-this-directory.txt
 *-llms-full.txt
 output/
 results/
+reference/
 
 # Logs
 *.log
