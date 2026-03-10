@@ -1,8 +1,7 @@
 """Generators for make-llmstxt."""
 
 from .critic import Critic, CriticResult, critique_generation
-from .llmstxt import LLMsTxtGenerator, generate_llmstxt
-from .llmstxt_agent import LLMsTxtAgentGenerator
+from .llmstxt import LLMsTxtGenerator
 from .skill import SkillGenerator
 from .base_agent import (
     DeepAgentGenerator,
@@ -16,8 +15,6 @@ __all__ = [
     "CriticResult",
     "critique_generation",
     "LLMsTxtGenerator",
-    "generate_llmstxt",
-    "LLMsTxtAgentGenerator",
     "SkillGenerator",
     # Base agent exports
     "DeepAgentGenerator",

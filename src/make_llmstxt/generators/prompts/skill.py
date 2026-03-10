@@ -139,33 +139,44 @@ Revise and add/update files as needed.
 # Skill Critic Prompts
 # ==============================================================================
 
-SKILL_CRITIC_SYSTEM = """You are a skill package critic. Validate skill packages against the llms.txt reference.
+SKILL_CRITIC_SYSTEM = """You are a skill package validator. Evaluate the generated skill package against the llms.txt reference.
 
-## llms.txt Reference (Ground Truth)
+## Pass/Fail Criteria
 
+1. **SKILL.md Exists**: Main skill file must exist with proper YAML frontmatter
+2. **Coverage**: All major topics from llms.txt reference are covered
+3. **Content Quality**: Each reference file is substantive (not sparse)
+4. **Code Examples**: Working code examples (not placeholder comments)
+5. **YAML Frontmatter**: name, description, version fields present
+6. **Directory Structure**: references/ and scripts/ directories created
+
+## Scoring
+
+- 0.9+: Excellent - comprehensive coverage, working code, substantial content
+- 0.7-0.8: Good - most topics covered, some code examples
+- 0.5-0.6: Acceptable - basic coverage, needs more content
+- <0.5: FAIL - missing SKILL.md, sparse content, no code examples
+
+Be strict. Quality matters for AI assistant usefulness.
+"""
+
+SKILL_CRITIC_PROMPT = """Evaluate this skill package:
+
+--- Generated Files ---
+{content}
+--- End ---
+
+--- llms.txt Reference (Ground Truth) ---
 {llmstxt_content}
+--- End ---
 
-## Your Task
+Check:
+1. Are all major topics from llms.txt covered?
+2. Is the content substantive (not sparse)?
+3. Are there working code examples?
+4. Is YAML frontmatter correct?
 
-1. Read the generated SKILL.md and all files in references/ and scripts/
-2. Compare coverage against the llms.txt reference
-3. Check for:
-   - All major topics from llms.txt are covered
-   - Code examples are complete (not placeholders)
-   - Content is substantive, not sparse
-   - YAML frontmatter is correct
-
-## Response Format
-
-If APPROVED:
-- Say "APPROVE" and briefly explain why it's good
-
-If NEEDS WORK:
-- List specific missing topics
-- List specific improvements needed
-- Be constructive and specific
-
-Do NOT approve sparse or incomplete packages. Quality matters.
+Provide specific issues and suggestions if not passing.
 """
 
 
@@ -181,5 +192,5 @@ SKILL_PROMPTS = AgentPrompts(
     subagent_description="Scrapes documentation pages for detailed content.",
     subagent_system=SKILL_SUBAGENT_SYSTEM,
     critic_system=SKILL_CRITIC_SYSTEM,
-    critic_approval_keyword="APPROVE",
+    critic_prompt_template=SKILL_CRITIC_PROMPT,
 )

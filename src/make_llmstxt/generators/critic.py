@@ -1,9 +1,10 @@
-"""Critic module for llms.txt validation.
+"""Critic module for validation using structured output.
 
 Uses .with_structured_output() for single-call validation with guaranteed Pydantic schema.
+Works for both llms.txt and skill package validation.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Callable
 from pydantic import BaseModel, Field
 from loguru import logger
 from langchain_openai import ChatOpenAI
@@ -35,55 +36,64 @@ class CriticResult(BaseModel):
 
 
 class Critic:
-    """LLM-based critic for llms.txt validation.
+    """LLM-based critic using structured output.
 
-    Uses .with_structured_output() for single-call validation.
+    Can be configured with different prompts for different validation tasks
+    (llms.txt, skill packages, etc.)
     """
 
     def __init__(
         self,
         llm: ChatOpenAI,
         pass_threshold: float = 0.7,
+        system_prompt: str = CRITIC_SYSTEM_PROMPT,
+        build_prompt: Optional[Callable] = None,
     ):
         """Initialize critic.
 
         Args:
             llm: LangChain ChatOpenAI instance (or ChatZAI for ZAI/GLM models)
             pass_threshold: Minimum score to pass (default 0.7)
+            system_prompt: System prompt for critic (default: llms.txt critic)
+            build_prompt: Callable to build evaluation prompt (default: build_critic_prompt)
         """
         self.pass_threshold = pass_threshold
+        self.system_prompt = system_prompt
+        self.build_prompt = build_prompt or build_critic_prompt
 
         # Create LLM with structured output - single call, guaranteed schema
         self.structured_llm = llm.with_structured_output(CriticResult)
 
     async def evaluate(
         self,
-        llmstxt: str,
+        content: str,
         url: Optional[str] = None,
         source_content: Optional[str] = None,
+        **kwargs,
     ) -> CriticResult:
-        """Evaluate llms.txt output quality.
+        """Evaluate generated content quality.
 
         Args:
-            llmstxt: The generated llms.txt content
+            content: The generated content to evaluate
             url: Original URL being processed (for context)
-            source_content: The scraped source content (for coverage validation)
+            source_content: Reference content (for coverage validation)
+            **kwargs: Additional args passed to build_prompt
 
         Returns:
             CriticResult with pass/fail and feedback
         """
-        prompt = build_critic_prompt(llmstxt, url, source_content)
+        prompt = self.build_prompt(content, url, source_content, **kwargs)
 
         messages = [
-            SystemMessage(content=CRITIC_SYSTEM_PROMPT),
+            SystemMessage(content=self.system_prompt),
             HumanMessage(content=prompt),
         ]
 
         try:
             # Single call with structured output - returns CriticResult directly
             logger.debug("[Critic] Evaluating with structured output...")
-            logger.debug(f"[Critic] Evaluating llms.txt ({len(llmstxt)} chars)")
-            logger.debug(f"[Critic] llms.txt content:\n{llmstxt[:2000]}{'...' if len(llmstxt) > 2000 else ''}")
+            logger.debug(f"[Critic] Evaluating content ({len(content)} chars)")
+            logger.debug(f"[Critic] Content preview:\n{content[:2000]}{'...' if len(content) > 2000 else ''}")
             result = await self.structured_llm.ainvoke(messages)
 
             # Apply pass threshold override

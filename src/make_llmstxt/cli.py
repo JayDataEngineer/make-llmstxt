@@ -1,12 +1,14 @@
 """Command-line interface for make-llmstxt.
 
 Supports two modes:
-- llms.txt: Index of pages with titles and descriptions (default)
-- skill: Skill package with folder structure (SKILL.md, scripts/, references/)
+- llmstxt: Generate llms.txt (index of pages with titles/descriptions)
+- skill: Generate skill package (SKILL.md, scripts/, references/)
 
+Both modes use the Deep Agent pattern (generator → critic → loop).
 """
 
 import argparse
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -14,12 +16,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 from loguru import logger
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-import asyncio
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.panel import Panel
 
 from .config import AppConfig, PROVIDER_PROFILES
-from .generators.llmstxt import generate_llmstxt
-from .generators.llmstxt_agent import LLMsTxtAgentGenerator
+from .generators.llmstxt import LLMsTxtGenerator
 from .generators.skill import SkillGenerator
 from .generators.prompts.llmstxt import LLMSTXT_PROMPTS
 from .generators.prompts.skill import SKILL_PROMPTS
@@ -46,16 +47,90 @@ def list_providers():
     console.print("[dim]Set API key via provider's env key (e.g., OPENAI_API_KEY)[/dim]")
 
 
-def handle_skill(args):
-    """Handle skill generation with Deep Agent."""
-    # Load env config first
-    env_config = AppConfig.from_env()
+def handle_llmstxt(args, env_config: AppConfig):
+    """Handle llms.txt generation using Deep Agent pattern."""
+    # Build unified config
+    config = GeneratorConfig(
+        url=args.url,
+        output_dir=Path(args.output_dir),
+        mcp_host=env_config.mcp.host,
+        mcp_port=env_config.mcp.port,
+        max_rounds=args.max_rounds,
+        pass_threshold=args.pass_threshold,
+        api_key=env_config.llm.api_key,
+        base_url=env_config.llm.base_url,
+        model=env_config.llm.model,
+        provider=env_config.llm.provider,
+        max_urls=args.max_urls,
+        prompts=LLMSTXT_PROMPTS,
+    )
 
-    # Run validation if requested or if clean is specified
+    # Override with CLI args
+    if args.provider:
+        config.provider = args.provider
+        if args.provider in PROVIDER_PROFILES:
+            profile = PROVIDER_PROFILES[args.provider]
+            config.model = args.model or profile["default_model"]
+    if args.model:
+        config.model = args.model
+    if args.base_url:
+        config.base_url = args.base_url
+    if args.api_key:
+        config.api_key = args.api_key
+
+    # Create generator
+    generator = LLMsTxtGenerator(config)
+
+    console.print(Panel.fit(
+        f"[bold cyan]LLMs.txt Generation[/bold cyan]\n"
+        f"URL: {args.url}\n"
+        f"Provider: {config.provider}\n"
+        f"Model: {config.model}\n"
+        f"MCP: {config.mcp_host}:{config.mcp_port}",
+        title="make-llmstxt",
+    ))
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("Starting...", total=None)
+
+        def progress_callback(message, percent):
+            progress.update(task_id, description=message)
+
+        try:
+            result = asyncio.run(
+                generator.generate(
+                    url=args.url,
+                    output_file=Path(args.output_dir) / "llms.txt",
+                    progress_callback=progress_callback,
+                )
+            )
+
+            console.print()
+            console.print(f"[green]✓ Success![/green] Generated llms.txt")
+            console.print(f"  Output: {result.output_path}")
+            console.print(f"  Critic passed: {result.stats.get('critic_passed', False)}")
+            console.print(f"  Rounds: {result.stats.get('rounds', 0)}")
+            logger.info(f"Generation complete: {result.output_path}")
+
+        except Exception as e:
+            logger.exception(f"Generation failed: {e}")
+            console.print(f"[red]Error: {e}[/red]")
+            if args.verbose:
+                console.print_exception()
+            sys.exit(1)
+
+
+def handle_skill(args, env_config: AppConfig):
+    """Handle skill generation using Deep Agent pattern."""
+    library_name = args.url.split("//")[-1].split("/")[0].replace("www.", "").replace("docs.", "").split(".")[0]
+    output_subdir = Path(args.output_dir) / library_name
+
+    # Run validation if requested
     if args.validate or args.clean:
-        library_name = args.url.split("//")[-1].split("/")[0].replace("www.", "").replace("docs.", "").split(".")[0]
-        output_subdir = Path(args.output_dir) / library_name
-
         validation_result = validate_skill_generation(
             output_dir=output_subdir,
             mcp_host=env_config.mcp.host,
@@ -64,7 +139,6 @@ def handle_skill(args):
             auto_fix=args.clean,
         )
 
-        # Print validation results
         if validation_result.fixes_applied:
             for fix in validation_result.fixes_applied:
                 console.print(f"[green]✓ {fix}[/green]")
@@ -97,6 +171,7 @@ def handle_skill(args):
         base_url=env_config.llm.base_url,
         model=env_config.llm.model,
         provider=env_config.llm.provider,
+        max_urls=args.max_urls,
         prompts=SKILL_PROMPTS,
     )
 
@@ -113,47 +188,42 @@ def handle_skill(args):
     if args.api_key:
         config.api_key = args.api_key
 
-    # Create skill generator
+    # Create generator
     generator = SkillGenerator(config)
 
-    console.print(f"\n[bold cyan]Starting skill generation for {args.url}...[/bold cyan]")
-    console.print(f"Provider: {config.provider}")
-    console.print(f"Model: {config.model}")
-    console.print(f"MCP: {config.mcp_host}:{config.mcp_port}")
-    console.print()
+    console.print(Panel.fit(
+        f"[bold cyan]Skill Package Generation[/bold cyan]\n"
+        f"URL: {args.url}\n"
+        f"Library: {library_name}\n"
+        f"Provider: {config.provider}\n"
+        f"Model: {config.model}\n"
+        f"MCP: {config.mcp_host}:{config.mcp_port}",
+        title="make-llmstxt",
+    ))
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         console=console,
     ) as progress:
-        task_id = progress.add_task("Initializing...", total=None)
+        task_id = progress.add_task("Starting...", total=None)
 
-        def progress_callback(*args):
-            """Handle progress updates with flexible signature."""
-            nonlocal task_id
-            if len(args) == 4:
-                message = args[3]
-            elif len(args) == 2:
-                message = args[0]
-            else:
-                message = str(args[0]) if args else ""
+        def progress_callback(message, percent):
             progress.update(task_id, description=message)
 
         try:
             result = asyncio.run(
                 generator.generate(
-                    args.url,
+                    url=args.url,
                     output_dir=Path(args.output_dir),
                     progress_callback=progress_callback,
                 )
             )
 
             console.print()
-            console.print(f"[green]Success![/green] Skill package created")
-            console.print(f"Output: {result.output_path}")
-            console.print(f"Pages processed: {result.stats.get('pages_processed', 0)}")
-            console.print(f"Files created: {result.stats.get('files_created', 0)}")
+            console.print(f"[green]✓ Success![/green] Skill package created")
+            console.print(f"  Output: {result.output_path}")
+            console.print(f"  Files created: {result.stats.get('files_created', 0)}")
             logger.info(f"Skill package created at {result.output_path}")
 
         except Exception as e:
@@ -184,12 +254,12 @@ def main():
     # Subparsers for different modes
     subparsers = parser.add_subparsers(dest="mode", help="Generation mode")
 
-    # ========== llms.txt mode (default) ==========
+    # ========== llmstxt mode ==========
     llmstxt_parser = subparsers.add_parser(
         "llmstxt",
-        help="Generate llms.txt and llms-full.txt (default mode)",
+        help="Generate llms.txt (index of pages with titles/descriptions)",
     )
-    llmstxt_parser.add_argument("url", nargs="?", help="Website URL to process")
+    llmstxt_parser.add_argument("url", help="Website URL to process")
     llmstxt_parser.add_argument(
         "--max-urls",
         type=int,
@@ -209,19 +279,16 @@ def main():
     llmstxt_parser.add_argument("--model", "-m", help="Model name to use")
     llmstxt_parser.add_argument("--base-url", help="Base URL for LLM API")
     llmstxt_parser.add_argument("--api-key", help="API key for LLM provider")
-    llmstxt_parser.add_argument("--no-critic", action="store_true", help="Disable critic validation")
-    llmstxt_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum draft-critic rounds")
-    llmstxt_parser.add_argument("--pass-threshold", type=float, default=0.7, help="Minimum score to pass critic")
-    llmstxt_parser.add_argument("--critic-strict", action="store_true", help="Fail if critic errors")
+    llmstxt_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum draft-critic rounds (default: 3)")
+    llmstxt_parser.add_argument("--pass-threshold", type=float, default=0.7, help="Minimum score to pass critic (default: 0.7)")
     llmstxt_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     llmstxt_parser.add_argument("--log-file", help="Path to log file")
     llmstxt_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")
-    llmstxt_parser.add_argument("--agent", action="store_true", help="Use Deep Agent pattern (generator → critic loop)")
 
     # ========== skill mode ==========
     skill_parser = subparsers.add_parser(
         "skill",
-        help="Generate a skill package (SKILL.md, scripts/, references/) using Deep Agent",
+        help="Generate a skill package (SKILL.md, scripts/, references/)",
     )
     skill_parser.add_argument("url", help="Library/framework documentation URL")
     skill_parser.add_argument("--output-dir", "-o", default=".", help="Output directory for skill package")
@@ -229,6 +296,7 @@ def main():
     skill_parser.add_argument("--model", "-m", help="Model name to use")
     skill_parser.add_argument("--base-url", help="Base URL for LLM API")
     skill_parser.add_argument("--api-key", help="API key for LLM provider")
+    skill_parser.add_argument("--max-urls", type=int, default=None, help="Maximum URLs to scrape")
     skill_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum critic revision rounds (default: 3)")
     skill_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     skill_parser.add_argument("--log-file", help="Path to log file")
@@ -256,143 +324,25 @@ def main():
         list_providers()
         return
 
-    # Handle skill mode
-    if args.mode == "skill":
-        handle_skill(args)
-        return
+    # Load environment config
+    env_config = AppConfig.from_env()
+    logger.debug(f"Loaded config from env: provider={env_config.llm.provider}")
+    logger.info(f"Using MCP scraper at {env_config.mcp.host}:{env_config.mcp.port}")
 
-    # Handle llms.txt mode (default)
-    if not hasattr(args, 'url') or not args.url:
-        parser.error("URL is required")
-
-    # Build configuration
-    config = AppConfig.from_env()
-    logger.debug(f"Loaded config from env: provider={config.llm.provider}")
-    logger.info(f"Using MCP scraper at {config.mcp.host}:{config.mcp.port}")
-
-    # Override LLM settings with command line args
-    if args.provider:
-        config.llm.provider = args.provider
-        if args.provider in PROVIDER_PROFILES:
-            profile = PROVIDER_PROFILES[args.provider]
-            config.llm.model = args.model or profile["default_model"]
-
-    if args.model:
-        config.llm.model = args.model
-    if args.base_url:
-        config.llm.base_url = args.base_url
-    if args.api_key:
-        config.llm.api_key = args.api_key
-
-    logger.info(f"LLM: provider={config.llm.provider}, model={config.llm.model}")
-
-    if not config.llm.api_key and config.llm.provider != "local":
-        console.print(f"[red]Error: LLM API key not provided for provider '{config.llm.provider}'[/red]")
+    # Check API key
+    if not env_config.llm.api_key and env_config.llm.provider != "local":
+        console.print(f"[red]Error: LLM API key not provided for provider '{env_config.llm.provider}'[/red]")
         console.print(f"Set the appropriate environment variable or use --api-key")
-        logger.error(f"LLM API key not provided for provider '{config.llm.provider}'")
+        logger.error(f"LLM API key not provided for provider '{env_config.llm.provider}'")
         sys.exit(1)
 
-    # Run llms.txt generation
-    try:
-        # Check if using agent mode
-        use_agent = getattr(args, 'agent', False)
-
-        if use_agent:
-            # Use Deep Agent pattern
-            console.print("[cyan]Using Deep Agent pattern for generation[/cyan]")
-
-            agent_config = GeneratorConfig(
-                url=args.url,
-                output_dir=Path(args.output_dir),
-                mcp_host=config.mcp.host,
-                mcp_port=config.mcp.port,
-                max_rounds=args.max_rounds,
-                pass_threshold=args.pass_threshold,
-                api_key=config.llm.api_key,
-                base_url=config.llm.base_url,
-                model=config.llm.model,
-                provider=config.llm.provider,
-                max_urls=args.max_urls,
-                prompts=LLMSTXT_PROMPTS,
-            )
-
-            generator = LLMsTxtAgentGenerator(agent_config)
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
-                task_id = progress.add_task("Generating llms.txt...", total=None)
-
-                def agent_progress_callback(message, percent):
-                    progress.update(task_id, description=message)
-
-                result = asyncio.run(
-                    generator.generate(
-                        args.url,
-                        output_file=Path(args.output_dir) / "llms.txt",
-                        progress_callback=agent_progress_callback,
-                    )
-                )
-
-            console.print()
-            console.print(f"[green]Success![/green] Generated llms.txt")
-            console.print(f"Output: {result.output_path}")
-            console.print(f"Critic passed: {result.stats.get('critic_passed', False)}")
-            console.print(f"Rounds: {result.stats.get('rounds', 0)}")
-            logger.info(f"Agent generation complete: {result.output_path}")
-
-        else:
-            # Use traditional batch pattern
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                console=console,
-            ) as progress:
-
-                task_id = None
-
-                def progress_callback(stage, current, total, message):
-                    nonlocal task_id
-                    logger.debug(f"Progress: {stage} - {current}/{total} - {message}")
-                    if stage == "mapping":
-                        if task_id is None:
-                            task_id = progress.add_task(message, total=total)
-                        progress.update(task_id, description=message, completed=current)
-                    elif stage == "scraping":
-                        if task_id is None:
-                            task_id = progress.add_task(message, total=total)
-                        progress.update(task_id, description=message, completed=current)
-
-                logger.info(f"Starting generation for {args.url}")
-                result = asyncio.run(
-                    generate_llmstxt(
-                        args.url,
-                        config=config,
-                        max_urls=args.max_urls,
-                        output_dir=Path(args.output_dir),
-                        progress_callback=progress_callback,
-                        enable_critic=not args.no_critic,
-                        max_retries=args.max_rounds,
-                        pass_threshold=args.pass_threshold,
-                    )
-                )
-
-            # Print summary
-            console.print()
-            console.print(f"[green]Success![/green] Processed {result.num_urls_processed} out of {result.num_urls_total} URLs")
-            console.print(f"Files saved to {args.output_dir}/")
-            logger.info(f"Generation complete: {result.num_urls_processed}/{result.num_urls_total} URLs processed")
-
-    except Exception as e:
-        logger.exception(f"Generation failed: {e}")
-        console.print(f"[red]Error: {e}[/red]")
-        if args.verbose:
-            console.print_exception()
-        sys.exit(1)
+    # Handle modes
+    if args.mode == "skill":
+        handle_skill(args, env_config)
+    elif args.mode == "llmstxt":
+        handle_llmstxt(args, env_config)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

@@ -9,9 +9,12 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
+from rich.console import Console
 
 # Load .env file at import time
 load_dotenv()
+
+console = Console()
 
 
 @dataclass
@@ -216,27 +219,23 @@ def main():
 
     # Print results
     if result.fixes_applied:
-        print("\n=== FIXES APPLIED ===")
         for fix in result.fixes_applied:
-            print(f"  ✓ {fix}")
+            console.print(f"[green]✓ {fix}[/green]")
 
     if result.warnings:
-        print("\n=== WARNINGS ===")
         for warning in result.warnings:
-            print(f"  ⚠ {warning}")
+            console.print(f"[yellow]⚠ {warning}[/yellow]")
 
     if result.errors:
-        print("\n=== ERRORS ===")
         for error in result.errors:
-            print(f"  ✗ {error}")
+            console.print(f"[red]✗ {error}[/red]")
 
     if result.valid:
-        print("\n✓ All validation checks passed!")
+        console.print("[green]✓ All validation checks passed[/green]")
         return 0
     else:
-        print("\n✗ Validation failed!")
         if not args.auto_fix:
-            print("  Run with --auto-fix to automatically fix issues")
+            console.print("[dim]Run with --auto-fix to automatically fix issues[/dim]")
         return 1
 
 

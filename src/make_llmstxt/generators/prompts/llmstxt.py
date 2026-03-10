@@ -104,19 +104,39 @@ Remember:
 # llms.txt Critic Prompts (used by structured output critic)
 # ==============================================================================
 
-LLMSTXT_CRITIC_SYSTEM = """You are an llms.txt critic. Evaluate the generated llms.txt file.
+LLMSTXT_CRITIC_SYSTEM = """You are a strict llms.txt validator. Evaluate the generated file against the specification.
 
-Check for:
-1. **H1 Header**: Is there a project name (not URL) at the top?
-2. **Blockquote**: Is there a one-line summary after H1?
-3. **Coverage**: Are ALL discovered URLs included?
-4. **Link Format**: Are links formatted as `- [Title](URL): Description.`?
-5. **Title Quality**: Are titles 2-5 words and specific?
-6. **Description Quality**: Are descriptions 5-12 words, informative, ending with period?
-7. **Section Organization**: Are URLs grouped into logical H2 sections?
-8. **No Placeholders**: Are there no "No description" or generic phrases?
+## Pass/Fail Criteria
 
-Score from 0.0 to 1.0 based on how well these criteria are met.
+1. **COVERAGE (CRITICAL)**: ALL URLs from source must be included. Missing URLs = FAIL.
+2. **H1 Header**: Project NAME (not URL) at top
+3. **Blockquote Summary**: One-line summary after H1
+4. **Link Format**: `- [Title](URL): Description.` format
+5. **Title Quality**: 2-5 words, specific (NOT "Home", "Page")
+6. **Description Quality**: 5-12 words, informative, ends with period
+7. **No Placeholders**: No "No description" or generic phrases
+8. **Section Organization**: URLs grouped under logical H2 sections
+9. **Optional Section**: Non-essential links under `## Optional`
+
+## Scoring
+
+- 0.9+: Excellent - all rules passed, complete coverage
+- 0.7-0.8: Good - minor issues, complete coverage
+- 0.5-0.6: Acceptable - usable but needs improvement
+- <0.5: FAIL - incomplete coverage, placeholders, wrong format
+
+Be strict. This is for machine consumption.
+"""
+
+LLMSTXT_CRITIC_PROMPT = """Evaluate this llms.txt file:
+
+--- Generated llms.txt ---
+{content}
+--- End ---
+
+{context}
+
+Check all criteria and provide issues/suggestions if not passing.
 """
 
 
@@ -132,5 +152,5 @@ LLMSTXT_PROMPTS = AgentPrompts(
     subagent_description="Scrapes a URL and returns title/description JSON.",
     subagent_system=LLMSTXT_SUBAGENT_SYSTEM,
     critic_system=LLMSTXT_CRITIC_SYSTEM,
-    critic_approval_keyword="APPROVE",
+    critic_prompt_template=LLMSTXT_CRITIC_PROMPT,
 )

@@ -22,9 +22,9 @@ class AgentPrompts:
     subagent_description: str = "Scrapes a URL and returns title/description JSON."
     subagent_system: str = ""
 
-    # Critic prompts (optional - if using LLM-based critic)
+    # Critic prompts (for structured output critic)
     critic_system: str = ""
-    critic_approval_keyword: str = "APPROVE"
+    critic_prompt_template: str = ""  # Template for building critic prompt
 
 
 class GeneratorConfig(BaseModel):
