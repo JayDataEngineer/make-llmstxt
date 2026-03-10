@@ -34,7 +34,7 @@ from ..scrapers import (
     MAIN_AGENT_TOOL_NAMES,
     SUBAGENT_TOOL_NAMES,
 )
-from ..store import get_store_from_config
+from ..store import EmbedLaterStore, create_store
 from .schemas import PageSummary
 
 
@@ -355,7 +355,14 @@ class DeepAgentGenerator:
                 graph = self._build_graph(generator_agent, llm, output_path, url)
 
             # Create store for full content persistence (optional)
-            store = get_store_from_config(self.config)
+            # Store content without embeddings during Stage 1
+            # Run `make-llmstxt embed` separately with embedding server for Stage 1.5
+            store = create_store(
+                store_dir=Path(self.config.output_dir) / ".store" if self.config.output_dir else None,
+                embedding_base_url=self.config.embedding_base_url,
+                embedding_model=self.config.embedding_model,
+                embedding_dims=self.config.embedding_dims,
+            )
 
             # Run the graph
             initial_message = self._format_initial_message(url, output_path)
@@ -608,12 +615,15 @@ class DeepAgentGenerator:
 
             Runs in parallel via Send with semaphore limiting.
             Stage 1 of two-stage pipeline: small summaries in state, full content persists.
+
+            Content is stored WITHOUT embeddings (index=False) for later batch embedding.
+            Run `make-llmstxt embed` with embedding server for Stage 1.5.
             """
             url = state["url"]
             max_c = state.get("max_content")
 
             # Get store from config (if available)
-            store: Optional[BaseStore] = config.get("configurable", {}).get("store")
+            store: Optional[EmbedLaterStore] = config.get("configurable", {}).get("store")
 
             # Use semaphore to limit concurrent scrapers
             async with semaphore:
@@ -624,9 +634,10 @@ class DeepAgentGenerator:
                     # Parse result and extract content
                     full_content = parse_result(result)
 
-                    # ACTION 1: Store FULL content in BaseStore (persists across runs)
+                    # ACTION 1: Store FULL content WITHOUT embeddings (embed-later mode)
+                    # This saves VRAM during scraping - embeddings generated separately
                     if store:
-                        # Use URL + content prefix for deduplication (handles content changes)
+                        # Use URL hash as key for deduplication
                         content_hash = hashlib.md5(f"{url}:{full_content[:1000]}".encode()).hexdigest()
 
                         await store.aput(
@@ -636,9 +647,10 @@ class DeepAgentGenerator:
                                 "url": url,
                                 "content": full_content,
                                 "scraped_at": datetime.now().isoformat(),
-                            }
+                            },
+                            index=False,  # Embed later with batch command
                         )
-                        logger.debug(f"{log_prefix} Stored {url} in BaseStore (key={content_hash[:8]}...)")
+                        logger.debug(f"{log_prefix} Stored {url} (no embedding, key={content_hash[:8]}...)")
 
                     # Truncate for LLM if configured (for summary generation)
                     content_for_llm = full_content

@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-make-llmstxt = "make_llmstxt.cli:main"
+make-llmstxt = "make_llmstxt.cli_main:main"
 
 [build-system]
 requires = ["hatchling"]

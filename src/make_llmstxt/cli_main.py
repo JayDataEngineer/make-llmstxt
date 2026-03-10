@@ -28,6 +28,7 @@ from .__init__ import __version__
 from .utils.logging import setup_logging
 from .core import GeneratorConfig
 from .validators import validate_skill_generation
+from .cli.embed import add_embed_parser, run_embed
 
 console = Console()
 
@@ -304,6 +305,9 @@ def main():
     skill_parser.add_argument("--clean", action="store_true", help="Clean output directory before generation")
     skill_parser.add_argument("--validate", action="store_true", help="Run validation checks before generation")
 
+    # ========== embed mode (Stage 1.5 - batch embedding) ==========
+    add_embed_parser(subparsers)
+
     # Parse arguments
     args = parser.parse_args()
 
@@ -341,6 +345,9 @@ def main():
         handle_skill(args, env_config)
     elif args.mode == "llmstxt":
         handle_llmstxt(args, env_config)
+    elif args.mode == "embed":
+        # Embed mode doesn't need LLM config - it's a batch job
+        sys.exit(run_embed(args))
     else:
         parser.print_help()
 
