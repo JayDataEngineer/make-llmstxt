@@ -34,7 +34,7 @@ from ..scrapers import (
     MAIN_AGENT_TOOL_NAMES,
     SUBAGENT_TOOL_NAMES,
 )
-from ..store import EmbedLaterStore, create_store
+from ..store import create_store
 from .schemas import PageSummary
 
 
@@ -354,11 +354,9 @@ class DeepAgentGenerator:
                 logger.info(f"{self.log_prefix} Using SERIAL scraping (conversational)")
                 graph = self._build_graph(generator_agent, llm, output_path, url)
 
-            # Create store for full content persistence (optional)
-            # Store content without embeddings during Stage 1
-            # Run `make-llmstxt embed` separately with embedding server for Stage 1.5
+            # Create store for full content with real-time embeddings
+            # Requires embedding server running (e.g., llama.cpp router mode with embed model)
             store = create_store(
-                store_dir=Path(self.config.output_dir) / ".store" if self.config.output_dir else None,
                 embedding_base_url=self.config.embedding_base_url,
                 embedding_model=self.config.embedding_model,
                 embedding_dims=self.config.embedding_dims,
@@ -634,8 +632,7 @@ class DeepAgentGenerator:
                     # Parse result and extract content
                     full_content = parse_result(result)
 
-                    # ACTION 1: Store FULL content WITHOUT embeddings (embed-later mode)
-                    # This saves VRAM during scraping - embeddings generated separately
+                    # Store full content with auto-generated embeddings
                     if store:
                         # Use URL hash as key for deduplication
                         content_hash = hashlib.md5(f"{url}:{full_content[:1000]}".encode()).hexdigest()
@@ -648,9 +645,9 @@ class DeepAgentGenerator:
                                 "content": full_content,
                                 "scraped_at": datetime.now().isoformat(),
                             },
-                            index=False,  # Embed later with batch command
+                            index=None,  # Auto-embed using store's embedding config
                         )
-                        logger.debug(f"{log_prefix} Stored {url} (no embedding, key={content_hash[:8]}...)")
+                        logger.debug(f"{log_prefix} Stored {url} (embedded, key={content_hash[:8]}...)")
 
                     # Truncate for LLM if configured (for summary generation)
                     content_for_llm = full_content
