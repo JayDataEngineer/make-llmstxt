@@ -10,8 +10,6 @@ from loguru import logger
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from ..core.prompts import CRITIC_SYSTEM_PROMPT, build_critic_prompt
-
 
 class CriticResult(BaseModel):
     """Structured result from critic evaluation."""
@@ -45,21 +43,21 @@ class Critic:
     def __init__(
         self,
         llm: ChatOpenAI,
-        pass_threshold: float = 0.7,
-        system_prompt: str = CRITIC_SYSTEM_PROMPT,
-        build_prompt: Optional[Callable] = None,
+        pass_threshold: float,
+        system_prompt: str,
+        build_prompt: Callable,
     ):
         """Initialize critic.
 
         Args:
             llm: LangChain ChatOpenAI instance (or ChatZAI for ZAI/GLM models)
-            pass_threshold: Minimum score to pass (default 0.7)
-            system_prompt: System prompt for critic (default: llms.txt critic)
-            build_prompt: Callable to build evaluation prompt (default: build_critic_prompt)
+            pass_threshold: Minimum score to pass
+            system_prompt: System prompt for critic
+            build_prompt: Callable to build evaluation prompt
         """
         self.pass_threshold = pass_threshold
         self.system_prompt = system_prompt
-        self.build_prompt = build_prompt or build_critic_prompt
+        self.build_prompt = build_prompt
 
         # Create LLM with structured output - single call, guaranteed schema
         self.structured_llm = llm.with_structured_output(CriticResult)

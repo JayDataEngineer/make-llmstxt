@@ -20,7 +20,7 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, ValidationError
 
 from ..config import LLMConfig, PROVIDER_PROFILES
-from ..core.prompts import (
+from ..generators.prompts import (
     SUMMARY_SYSTEM_PROMPT,
     SUMMARY_PROMPT_TEMPLATE,
     SUMMARY_RETRY_PROMPT_TEMPLATE,
