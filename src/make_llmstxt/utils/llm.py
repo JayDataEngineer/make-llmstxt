@@ -28,6 +28,54 @@ from ..core.prompts import (
 
 
 # =============================================================================
+# JSON Extraction Utility
+# =============================================================================
+
+def extract_json_from_text(text: str) -> str:
+    """Extract JSON from text, handling markdown code blocks.
+
+    Handles:
+    - ```json...``` blocks
+    - ```...``` blocks
+    - Raw JSON objects
+
+    Args:
+        text: Text that may contain JSON
+
+    Returns:
+        Extracted JSON string
+
+    Raises:
+        ValueError: If no JSON can be found
+    """
+    # Try ```json block first
+    if "```json" in text:
+        start = text.find("```json") + 7
+        end = text.find("```", start)
+        if end > start:
+            return text[start:end].strip()
+
+    # Try ``` block
+    if "```" in text:
+        start = text.find("```") + 3
+        # Skip language identifier if present
+        if text[start:start+4].lower() in ("json", "java"):
+            start = text.find("\n", start) + 1
+        end = text.find("```", start)
+        if end > start:
+            return text[start:end].strip()
+
+    # Try to find raw JSON object
+    json_start = text.find("{")
+    json_end = text.rfind("}") + 1
+    if json_start != -1 and json_end > json_start:
+        return text[json_start:json_end]
+
+    # No JSON found
+    raise ValueError(f"No JSON found in response: {text[:200]}...")
+
+
+# =============================================================================
 # ChatZAI - Custom ChatOpenAI subclass for ZAI/GLM models
 # =============================================================================
 
@@ -126,38 +174,8 @@ class ChatZAI(ChatOpenAI):
         )
 
     def _extract_json(self, text: str) -> str:
-        """Extract JSON from text, handling markdown code blocks.
-
-        Handles:
-        - ```json...``` blocks
-        - ```...``` blocks
-        - Raw JSON objects
-        """
-        # Try ```json block first
-        if "```json" in text:
-            start = text.find("```json") + 7
-            end = text.find("```", start)
-            if end > start:
-                return text[start:end].strip()
-
-        # Try ``` block
-        if "```" in text:
-            start = text.find("```") + 3
-            # Skip language identifier if present
-            if text[start:start+4].lower() in ("json", "java"):
-                start = text.find("\n", start) + 1
-            end = text.find("```", start)
-            if end > start:
-                return text[start:end].strip()
-
-        # Try to find raw JSON object
-        json_start = text.find("{")
-        json_end = text.rfind("}") + 1
-        if json_start != -1 and json_end > json_start:
-            return text[json_start:json_end]
-
-        # No JSON found
-        raise ValueError(f"No JSON found in response: {text[:200]}...")
+        """Extract JSON from text. Delegates to module-level function."""
+        return extract_json_from_text(text)
 
 
 # =============================================================================
@@ -283,10 +301,7 @@ async def generate_summary(
         response_content = response.content.strip()
 
         # Try to extract JSON from response
-        if "```json" in response_content:
-            response_content = response_content.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_content:
-            response_content = response_content.split("```")[1].split("```")[0].strip()
+        response_content = extract_json_from_text(response_content)
 
         result = json.loads(response_content)
 

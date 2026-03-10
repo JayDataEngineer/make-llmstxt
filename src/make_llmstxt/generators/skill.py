@@ -33,11 +33,7 @@ class SkillGenerator(DeepAgentGenerator):
     """
 
     def __init__(self, config: GeneratorConfig):
-        # Set prompts if not already set
-        if config.prompts is None:
-            config = config.model_copy(update={"prompts": SKILL_PROMPTS})
-
-        super().__init__(config, log_prefix="[SkillGenerator]")
+        super().__init__(config, log_prefix="[SkillGenerator]", default_prompts=SKILL_PROMPTS)
         self._llmstxt_content: Optional[str] = None
 
     async def generate(

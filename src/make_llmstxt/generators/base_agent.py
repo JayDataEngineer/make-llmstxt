@@ -211,7 +211,16 @@ class DeepAgentGenerator:
     - _get_output_path(): Determine output path from config
     """
 
-    def __init__(self, config: GeneratorConfig, log_prefix: str = "[DeepAgent]"):
+    def __init__(
+        self,
+        config: GeneratorConfig,
+        log_prefix: str = "[DeepAgent]",
+        default_prompts: Optional[AgentPrompts] = None,
+    ):
+        # Set prompts if not already set
+        if config.prompts is None and default_prompts is not None:
+            config = config.model_copy(update={"prompts": default_prompts})
+
         self.config = config
         self.log_prefix = log_prefix
 

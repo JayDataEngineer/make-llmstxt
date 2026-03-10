@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import List
 
 from loguru import logger
-from langchain_openai import ChatOpenAI
 
 from ..core import GeneratorConfig, GeneratorResult
 from .base_agent import DeepAgentGenerator, extract_name_from_url
@@ -30,11 +29,7 @@ class LLMsTxtAgentGenerator(DeepAgentGenerator):
     """
 
     def __init__(self, config: GeneratorConfig):
-        # Set prompts if not already set
-        if config.prompts is None:
-            config = config.model_copy(update={"prompts": LLMSTXT_PROMPTS})
-
-        super().__init__(config, log_prefix="[LLMsTxtAgent]")
+        super().__init__(config, log_prefix="[LLMsTxtAgent]", default_prompts=LLMSTXT_PROMPTS)
         self._critic = None
 
     async def generate(
@@ -79,12 +74,8 @@ class LLMsTxtAgentGenerator(DeepAgentGenerator):
 
         # Create critic if needed
         if self._critic is None:
-            llm = ChatOpenAI(
-                model=self.config.model,
-                api_key=self.config.api_key,
-                base_url=self.config.base_url,
-                temperature=0.0,
-            )
+            llm = self._create_llm()
+            llm.temperature = 0.0  # Critic should be deterministic
             self._critic = Critic(llm, pass_threshold=self.config.pass_threshold)
 
         # Run critic
