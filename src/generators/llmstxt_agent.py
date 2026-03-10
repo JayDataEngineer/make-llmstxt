@@ -29,7 +29,7 @@ from ..config import AppConfig
 from ..scrapers import (
     get_mcp_tools,
     filter_tools_by_name,
-    MAIN_AGENT_TOOL_NAMES,
+    LLMSTXT_AGENT_TOOL_NAMES,
     SUBAGENT_TOOL_NAMES,
 )
 from .critic import Critic, CriticResult
@@ -266,7 +266,7 @@ class LLMsTxtAgentGenerator:
             self.config.mcp_port,
             max_urls=self.config.max_urls,
         ) as all_tools:
-            main_tools = filter_tools_by_name(all_tools, MAIN_AGENT_TOOL_NAMES)
+            main_tools = filter_tools_by_name(all_tools, LLMSTXT_AGENT_TOOL_NAMES)
             subagent_tools = filter_tools_by_name(all_tools, SUBAGENT_TOOL_NAMES)
 
             logger.info(f"[LLMsTxtAgent] Main agent tools: {[t.name for t in main_tools]}")

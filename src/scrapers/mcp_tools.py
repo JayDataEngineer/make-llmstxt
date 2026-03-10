@@ -17,6 +17,8 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 MAIN_AGENT_TOOL_NAMES: Set[str] = {"map_domain", "crawl_site", "scrape_url"}
 SUBAGENT_TOOL_NAMES: Set[str] = {"scrape_url"}
+# For llms.txt agent - no crawl_site (would blow up context)
+LLMSTXT_AGENT_TOOL_NAMES: Set[str] = {"map_domain", "scrape_url"}
 ALL_SCRAPER_TOOLS: Set[str] = MAIN_AGENT_TOOL_NAMES | SUBAGENT_TOOL_NAMES
 
 

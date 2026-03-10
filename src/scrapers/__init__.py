@@ -11,6 +11,7 @@ from .mcp_tools import (
     mcp_map_website,
     MAIN_AGENT_TOOL_NAMES,
     SUBAGENT_TOOL_NAMES,
+    LLMSTXT_AGENT_TOOL_NAMES,
     ALL_SCRAPER_TOOLS,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "mcp_map_website",
     "MAIN_AGENT_TOOL_NAMES",
     "SUBAGENT_TOOL_NAMES",
+    "LLMSTXT_AGENT_TOOL_NAMES",
     "ALL_SCRAPER_TOOLS",
 ]
