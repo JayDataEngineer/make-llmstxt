@@ -82,6 +82,8 @@ class Critic:
         try:
             # Single call with structured output - returns CriticResult directly
             logger.debug("[Critic] Evaluating with structured output...")
+            logger.debug(f"[Critic] Evaluating llms.txt ({len(llmstxt)} chars)")
+            logger.debug(f"[Critic] llms.txt content:\n{llmstxt[:2000]}{'...' if len(llmstxt) > 2000 else ''}")
             result = await self.structured_llm.ainvoke(messages)
 
             # Apply pass threshold override
@@ -101,9 +103,14 @@ class Critic:
                 f"issues={len(result.issues)}"
             )
 
+            # Log full critic output
+            logger.info(f"[Critic] Full result: {result.model_dump_json(indent=2)}")
+
             if not result.passed:
-                for issue in result.issues:
-                    logger.warning(f"  Issue: {issue}")
+                for i, issue in enumerate(result.issues):
+                    logger.warning(f"  Issue {i+1}: {issue}")
+                for i, suggestion in enumerate(result.suggestions):
+                    logger.info(f"  Suggestion {i+1}: {suggestion}")
 
             return result
 
