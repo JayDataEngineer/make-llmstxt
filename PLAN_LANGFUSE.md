@@ -9,8 +9,9 @@ This guide documents the complete journey from basic logging to full Langfuse ob
 3. [Phase 2: SDK Initialization](#3-phase-2-sdk-initialization)
 4. [Phase 3: Adding Traces](#4-phase-3-adding-traces)
 5. [Phase 4: Adding Sessions](#5-phase-4-adding-sessions)
-6. [Complete Integration](#6-complete-integration)
-7. [Troubleshooting](#7-troubleshooting)
+6. [Phase 5: Automatic Model Name Detection](#6-phase-5-automatic-model-name-detection)
+7. [Complete Integration](#7-complete-integration)
+8. [Troubleshooting](#8-troubleshooting)
 
 ---
 
@@ -452,7 +453,182 @@ class BaseAgent:
 
 ---
 
-## 6. Complete Integration
+## 6. Phase 5: Automatic Model Name Detection
+
+When using router/proxy servers (like llama.cpp), the API model name is often just an alias (e.g., `llm`) rather than the actual model name. This makes traces harder to analyze in Langfuse.
+
+### 6.1 The Problem
+
+```python
+# Router config uses aliases
+[llm]
+model = /models/Qwen-2.5-7B-Instruct-Q4_K_M.gguf
+
+# But API only sees "llm" as the model name
+# Langfuse shows "llm" instead of "Qwen-2.5-7B"
+```
+
+### 6.2 The Solution: Auto-Detection
+
+The system automatically detects the model name using this priority:
+
+1. **Explicit env var**: `LLM_MODEL_DISPLAY_NAME` (manual override)
+2. **Model path extraction**: `LLM_MODEL_PATH` filename
+3. **Server query**: llama.cpp `/props` endpoint (for local providers)
+4. **Fallback**: Use the model name as-is (works for cloud providers)
+
+### 6.3 Implementation
+
+```python
+# src/make_llmstxt/config.py
+
+import re
+import urllib.request
+import json
+from pathlib import Path
+
+def _extract_model_display_name(model_path: str) -> str:
+    """Extract a clean display name from a model file path.
+
+    Example: /models/Qwen-2.5-7B-Instruct-Q4_K_M.gguf -> "Qwen-2.5-7B"
+    """
+    # Get filename without extension
+    filename = Path(model_path).stem
+
+    # Remove common quantization suffixes
+    quant_patterns = [
+        r'-[Qq]\d(_[A-Za-z\d]+)?',  # Q4_K_M, q4_k_m, Q4, etc.
+        r'-[Ii][Qq]\d+_[A-Za-z]+',   # IQ4_XS, etc.
+        r'-[Ff]\d+',                  # F16, F32, etc.
+        r'-[Bb][Pp][Ww]\d+(?:-\d+)?', # BPW4, BPW4-8, etc.
+        r'-[Ee][Xx][Ll]2',            # EXL2
+    ]
+
+    for pattern in quant_patterns:
+        filename = re.sub(pattern, '', filename)
+
+    # Remove common suffixes
+    suffixes_to_remove = ['-Instruct', '-instruct', '-Chat', '-chat', r'-v\d+']
+    for suffix in suffixes_to_remove:
+        filename = re.sub(suffix + '$', '', filename)
+
+    return filename
+
+
+def _fetch_model_name_from_server(base_url: str, model_alias: str) -> Optional[str]:
+    """Fetch actual model name from llama.cpp server.
+
+    Queries the server's /props endpoint to get model metadata.
+    """
+    server_url = base_url.rstrip("/").removesuffix("/v1")
+
+    try:
+        props_url = f"{server_url}/props"
+        req = urllib.request.Request(props_url, method="GET")
+        req.add_header("Accept", "application/json")
+
+        with urllib.request.urlopen(req, timeout=2) as response:
+            data = json.loads(response.read().decode())
+
+            # llama.cpp returns model path in various fields
+            model_path = (
+                data.get("model_path") or
+                data.get("default_generation_settings", {}).get("model_path") or
+                data.get("model") or
+                data.get("general_name")
+            )
+
+            if model_path:
+                return _extract_model_display_name(model_path)
+
+    except Exception:
+        pass  # Server not available or doesn't support this endpoint
+
+    return None
+```
+
+### 6.4 Config Integration
+
+```python
+# In AppConfig.from_env()
+
+@staticmethod
+def _get_display_name(provider: str, model: str, base_url: Optional[str]) -> Optional[str]:
+    """Get display name with auto-detection priority."""
+    # 1. Check explicit env var
+    display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
+    if display_name:
+        return display_name
+
+    # 2. Extract from model path
+    model_path = os.getenv("LLM_MODEL_PATH")
+    if model_path:
+        return _extract_model_display_name(model_path)
+
+    # 3. For local providers, query server for model info
+    if provider in ("local",) and base_url:
+        server_name = _fetch_model_name_from_server(base_url, model)
+        if server_name:
+            return server_name
+
+    # 4. For cloud providers, model name is already descriptive
+    return None
+```
+
+### 6.5 LLM Integration
+
+```python
+# src/make_llmstxt/utils/llm.py
+
+class ChatOpenAIWithDisplayName(ChatOpenAI):
+    """ChatOpenAI subclass that reports a display name to observability tools."""
+
+    display_name: str = ""
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        """Override to return display_name as model_name for observability."""
+        params = super()._identifying_params
+        if self.display_name:
+            params["model_name"] = self.display_name
+        return params
+```
+
+### 6.6 Example Transformations
+
+| Model Path | Display Name |
+|------------|--------------|
+| `/models/Qwen-2.5-7B-Instruct-Q4_K_M.gguf` | `Qwen-2.5-7B` |
+| `/models/deepseek-r1-671b-BPW4.gguf` | `deepseek-r1-671b` |
+| `/models/llama-3.2-3b-chat.F16.gguf` | `llama-3.2-3b` |
+| `/models/mistral-7b-v0.3-IQ4_XS.gguf` | `mistral-7b` |
+
+### 6.7 Usage
+
+**Automatic (recommended):**
+```bash
+# Just set LLM_MODEL_PATH - display name is auto-derived
+LLM_MODEL_PATH=/models/Qwen-2.5-7B-Instruct-Q4_K_M.gguf
+# Langfuse shows: "Qwen-2.5-7B"
+```
+
+**Manual override:**
+```bash
+# If auto-detection doesn't work, set explicitly
+LLM_MODEL_DISPLAY_NAME="Qwen-2.5-7B-Custom"
+```
+
+**Cloud providers:**
+```bash
+# No config needed - model name is already descriptive
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o-mini
+# Langfuse shows: "gpt-4o-mini"
+```
+
+---
+
+## 7. Complete Integration
 
 ### 6.1 Full Observability Module
 
@@ -756,7 +932,7 @@ open http://localhost:3000
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 ### No Traces Appearing
 
