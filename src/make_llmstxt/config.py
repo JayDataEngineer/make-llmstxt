@@ -17,7 +17,11 @@ from pathlib import Path
 class LLMConfig(BaseModel):
     """LLM configuration - works with any OpenAI-compatible provider."""
 
-    model: str = Field(default="gpt-4o-mini", description="Model name")
+    model: str = Field(default="gpt-4o-mini", description="Model name (API identifier)")
+    model_display_name: Optional[str] = Field(
+        default=None,
+        description="Display name for observability (e.g., 'Qwen-2.5-7B' when model='llm')"
+    )
     api_key: Optional[str] = Field(default=None, description="API key")
     base_url: Optional[str] = Field(default=None, description="Base URL for API")
     temperature: float = Field(default=0.3, ge=0.0, le=2.0)
@@ -126,6 +130,7 @@ class AppConfig(BaseModel):
             env_key, default_base_url = provider_settings[llm_provider]
             config.llm.provider = llm_provider
             config.llm.model = os.getenv("LLM_MODEL", cls._get_default_model(llm_provider))
+            config.llm.model_display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
             config.llm.api_key = os.getenv(env_key)
             if default_base_url:
                 config.llm.base_url = os.getenv("LLM_BASE_URL", default_base_url)

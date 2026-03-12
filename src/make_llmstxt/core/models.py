@@ -41,9 +41,14 @@ class GeneratorConfig(BaseModel):
     max_urls: Optional[int] = Field(default=None, description="Max URLs to process (None = unlimited)")
     mcp_host: str = Field(default="100.85.22.99", description="MCP server host")
     mcp_port: int = Field(default=8000, description="MCP server port")
+    mcp_url: Optional[str] = Field(default=None, description="Full MCP URL (overrides host/port)")
 
     # LLM config
-    model: str = Field(default="glm-4.5-air", description="Model identifier")
+    model: str = Field(default="glm-4.7", description="Model identifier (API model name)")
+    model_display_name: Optional[str] = Field(
+        default=None,
+        description="Display name for observability (e.g., 'Qwen-2.5-7B' when model='llm')"
+    )
     provider: str = Field(default="zai", description="LLM provider name")
     api_key: Optional[str] = Field(default=None, description="API key for LLM provider")
     base_url: Optional[str] = Field(default=None, description="Base URL for LLM API")
@@ -63,8 +68,19 @@ class GeneratorConfig(BaseModel):
     max_content_per_doc: Optional[int] = Field(default=None, description="Max chars per scraped doc (None = no limit)")
 
     # Fast LLM for parallel summarization (cheaper model for Stage 1 summaries)
-    fast_model: str = Field(default="gpt-4o-mini", description="Fast model for summarization")
+    # Default to None to use the same model as main LLM
+    fast_model: Optional[str] = Field(default=None, description="Fast model for summarization (None = use main model)")
     fast_model_temperature: float = Field(default=0.1, description="Temperature for fast model")
+
+    # Thinking/Reasoning config - provider-specific implementation:
+    # - llama.cpp (Qwen): extra_body.chat_template_kwargs.enable_thinking
+    # - llama.cpp (DeepSeek-R1): reasoning_effort
+    # - OpenAI o1/o3: reasoning_effort
+    # Enable for main agent and critic, disable for subagents/scraper workers
+    enable_thinking: bool = Field(
+        default=True,
+        description="Enable thinking/reasoning mode. Provider-specific: Qwen=enable_thinking, DeepSeek-R1/o1=reasoning_effort. ON for main agent/critic, OFF for subagents."
+    )
 
     # Local embeddings config (for Store semantic search)
     # In router mode, use same base_url as chat, different model name
@@ -94,3 +110,6 @@ class GeneratorResult(BaseModel):
     """
     output_path: Path
     stats: dict = Field(default_factory=dict)
+
+    class Config:
+        extra = "allow"  # Allow additional fields like llmstxt

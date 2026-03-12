@@ -281,9 +281,12 @@ class DeepAgentGenerator:
         Returns:
             ChatOpenAI instance configured with reasoning mode
         """
+        from ..utils.llm import ChatOpenAIWithDisplayName
+
         thinking = enable_thinking if enable_thinking is not None else self.config.enable_thinking
         model_name = model or self.config.model
         temp = temperature if temperature is not None else self.config.temperature
+        display_name = self.config.model_display_name
 
         # Build provider-specific reasoning parameters
         extra_kwargs: Dict[str, Any] = {}
@@ -305,14 +308,26 @@ class DeepAgentGenerator:
         from ..utils.observability import get_langfuse_callback
         callbacks = get_langfuse_callback()
 
-        return ChatOpenAI(
-            model=model_name,
-            temperature=temp,
-            api_key=self.config.api_key,
-            base_url=self.config.base_url,
-            callbacks=callbacks if callbacks else None,
-            **extra_kwargs,
-        )
+        # Use ChatOpenAIWithDisplayName if display_name is set (for observability)
+        if display_name:
+            return ChatOpenAIWithDisplayName(
+                model=model_name,
+                display_name=display_name,
+                temperature=temp,
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                callbacks=callbacks if callbacks else None,
+                **extra_kwargs,
+            )
+        else:
+            return ChatOpenAI(
+                model=model_name,
+                temperature=temp,
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                callbacks=callbacks if callbacks else None,
+                **extra_kwargs,
+            )
 
     def _create_subagent(self, tools: List) -> Optional[SubAgent]:
         """Create subagent if subagent_system is provided."""

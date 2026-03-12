@@ -88,6 +88,8 @@ def handle_llmstxt(args, env_config: AppConfig):
             config.api_key = args.api_key or os.getenv(env_key)
     if args.model:
         config.model = args.model
+    if args.model_display_name:
+        config.model_display_name = args.model_display_name
     if args.base_url:
         config.base_url = args.base_url
     if args.api_key:
@@ -231,6 +233,8 @@ def handle_skill(args, env_config: AppConfig):
             config.api_key = args.api_key or os.getenv(env_key)
     if args.model:
         config.model = args.model
+    if args.model_display_name:
+        config.model_display_name = args.model_display_name
     if args.base_url:
         config.base_url = args.base_url
     if args.api_key:
@@ -339,7 +343,8 @@ def main():
         choices=list(PROVIDER_PROFILES.keys()),
         help="LLM provider to use",
     )
-    llmstxt_parser.add_argument("--model", "-m", help="Model name to use")
+    llmstxt_parser.add_argument("--model", "-m", help="Model name to use (API identifier)")
+    llmstxt_parser.add_argument("--model-display-name", help="Display name for observability (e.g., 'Qwen-2.5-7B' when model='llm')")
     llmstxt_parser.add_argument("--base-url", help="Base URL for LLM API")
     llmstxt_parser.add_argument("--api-key", help="API key for LLM provider")
     llmstxt_parser.add_argument("--max-rounds", type=int, default=3, help="Maximum draft-critic rounds (default: 3)")
@@ -360,7 +365,8 @@ def main():
     skill_parser.add_argument("url", help="Library/framework documentation URL")
     skill_parser.add_argument("--output-dir", "-o", default=".", help="Output directory for skill package")
     skill_parser.add_argument("--provider", "-p", choices=list(PROVIDER_PROFILES.keys()), help="LLM provider")
-    skill_parser.add_argument("--model", "-m", help="Model name to use")
+    skill_parser.add_argument("--model", "-m", help="Model name to use (API identifier)")
+    skill_parser.add_argument("--model-display-name", help="Display name for observability (e.g., 'Qwen-2.5-7B' when model='llm')")
     skill_parser.add_argument("--base-url", help="Base URL for LLM API")
     skill_parser.add_argument("--api-key", help="API key for LLM provider")
     skill_parser.add_argument("--max-urls", type=int, default=None, help="Maximum URLs to scrape")

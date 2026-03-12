@@ -132,6 +132,39 @@ class ChatZAI(ChatOpenAI):
 
 
 # =============================================================================
+# ChatOpenAIWithDisplayName - Custom ChatOpenAI for observability
+# =============================================================================
+
+class ChatOpenAIWithDisplayName(ChatOpenAI):
+    """ChatOpenAI subclass that reports a display name to observability tools.
+
+    Useful when using router/proxy servers where the API model name (e.g., "llm")
+    doesn't reflect the actual model (e.g., "Qwen-2.5-7B").
+
+    The display name is returned in _identifying_params for Langfuse and other
+    observability tools to pick up.
+
+    Usage:
+        llm = ChatOpenAIWithDisplayName(
+            model="llm",  # Router alias
+            display_name="Qwen-2.5-7B",  # Actual model for observability
+            api_key="...",
+            base_url="...",
+        )
+    """
+
+    display_name: str = ""
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        """Override to return display_name as model_name for observability."""
+        params = super()._identifying_params
+        if self.display_name:
+            params["model_name"] = self.display_name
+        return params
+
+
+# =============================================================================
 # Page Summary Generation (for parallel scraping)
 # =============================================================================
 
