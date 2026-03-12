@@ -10,6 +10,8 @@ Scraping via your custom MCP server.
 
 import os
 import re
+import urllib.request
+import json
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -45,13 +47,57 @@ def _extract_model_display_name(model_path: str) -> str:
         '-instruct',
         '-Chat',
         '-chat',
-        '-v\d+',  # Version numbers like -v1, -v2
+        r'-v\d+',  # Version numbers like -v1, -v2
     ]
 
     for suffix in suffixes_to_remove:
         filename = re.sub(suffix + '$', '', filename)
 
     return filename
+
+
+def _fetch_model_name_from_server(base_url: str, model_alias: str) -> Optional[str]:
+    """Fetch actual model name from llama.cpp server.
+
+    Queries the server's /props endpoint to get model metadata.
+
+    Args:
+        base_url: Base URL of the LLM server (e.g., "http://localhost:8001/v1")
+        model_alias: Model alias used in API calls (e.g., "llm")
+
+    Returns:
+        Model display name or None if unavailable
+    """
+    # Try to get model info from llama.cpp server
+    # Remove /v1 suffix if present to get base server URL
+    server_url = base_url.rstrip("/").removesuffix("/v1")
+
+    try:
+        # Query /props endpoint for model metadata
+        props_url = f"{server_url}/props"
+        req = urllib.request.Request(props_url, method="GET")
+        req.add_header("Accept", "application/json")
+
+        with urllib.request.urlopen(req, timeout=2) as response:
+            data = json.loads(response.read().decode())
+
+            # llama.cpp returns model path in various fields
+            # Try to extract from different possible locations
+            model_path = (
+                data.get("model_path") or
+                data.get("default_generation_settings", {}).get("model_path") or
+                data.get("model") or
+                data.get("general_name")  # Some versions use this
+            )
+
+            if model_path:
+                return _extract_model_display_name(model_path)
+
+    except Exception:
+        # Server not available or doesn't support this endpoint
+        pass
+
+    return None
 
 
 class LLMConfig(BaseModel):
@@ -171,14 +217,6 @@ class AppConfig(BaseModel):
             config.llm.provider = llm_provider
             config.llm.model = os.getenv("LLM_MODEL", cls._get_default_model(llm_provider))
 
-            # Auto-derive display name from model path if not explicitly set
-            display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
-            if not display_name:
-                model_path = os.getenv("LLM_MODEL_PATH")
-                if model_path:
-                    display_name = _extract_model_display_name(model_path)
-            config.llm.model_display_name = display_name
-
             config.llm.api_key = os.getenv(env_key)
             if default_base_url:
                 config.llm.base_url = os.getenv("LLM_BASE_URL", default_base_url)
@@ -186,17 +224,16 @@ class AppConfig(BaseModel):
             # Custom provider
             config.llm.provider = llm_provider
             config.llm.model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
-            # Auto-derive display name from model path if not explicitly set
-            display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
-            if not display_name:
-                model_path = os.getenv("LLM_MODEL_PATH")
-                if model_path:
-                    display_name = _extract_model_display_name(model_path)
-            config.llm.model_display_name = display_name
-
             config.llm.api_key = os.getenv("LLM_API_KEY")
             config.llm.base_url = os.getenv("LLM_BASE_URL")
+
+        # Auto-derive display name for observability
+        # Priority: explicit env var > model path > server query
+        config.llm.model_display_name = cls._get_display_name(
+            provider=llm_provider,
+            model=config.llm.model,
+            base_url=config.llm.base_url,
+        )
 
         # MCP config
         config.mcp.host = os.getenv("MCP_HOST", "100.85.22.99")
@@ -221,6 +258,45 @@ class AppConfig(BaseModel):
             "local": "local-model",
         }
         return defaults.get(provider, "gpt-4o-mini")
+
+    @staticmethod
+    def _get_display_name(provider: str, model: str, base_url: Optional[str]) -> Optional[str]:
+        """Get display name for model, with auto-detection for local providers.
+
+        Priority:
+        1. Explicit LLM_MODEL_DISPLAY_NAME env var
+        2. Extract from LLM_MODEL_PATH filename
+        3. Query from llama.cpp server (for local providers)
+        4. None (use model name as-is)
+
+        Args:
+            provider: Provider name (e.g., "local", "openai")
+            model: Model identifier (e.g., "llm", "gpt-4o-mini")
+            base_url: Base URL for API (used for server query)
+
+        Returns:
+            Display name or None if model name is already descriptive
+        """
+        # 1. Check explicit env var
+        display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
+        if display_name:
+            return display_name
+
+        # 2. Extract from model path
+        model_path = os.getenv("LLM_MODEL_PATH")
+        if model_path:
+            return _extract_model_display_name(model_path)
+
+        # 3. For local providers, try to query server for model info
+        # Only do this for providers that might use router aliases
+        if provider in ("local",) and base_url:
+            server_name = _fetch_model_name_from_server(base_url, model)
+            if server_name:
+                return server_name
+
+        # 4. For cloud providers, model name is already descriptive
+        # Return None to indicate no override needed
+        return None
 
 
 # Convenience: provider profiles for CLI help
