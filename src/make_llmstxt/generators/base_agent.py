@@ -15,7 +15,6 @@ import operator
 from pathlib import Path
 from urllib.parse import urlparse
 
-from loguru import logger
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 from langchain_core.runnables import RunnableConfig
@@ -23,9 +22,14 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send
 from langgraph.store.base import BaseStore
-from deepagents import create_deep_agent
-from deepagents.backends import FilesystemBackend
+from deepagents.graph import create_agent, FilesystemMiddleware
+from deepagents.backends import FilesystemBackend, CompositeBackend
+from ..backends.docs_backend import DocsBackend
 from deepagents.middleware.subagents import SubAgent
+from ..utils.logging import StructuredLogger
+from ..utils.observability import init_langfuse, flush_langfuse, create_session_id, session_context
+
+log = StructuredLogger("agent")
 
 from ..core import GeneratorConfig, GeneratorResult, AgentPrompts
 from ..scrapers import (
@@ -35,6 +39,7 @@ from ..scrapers import (
     SUBAGENT_TOOL_NAMES,
 )
 from ..store import create_store
+from ..tools import search_docs, get_doc_by_url
 from .schemas import PageSummary
 
 
@@ -58,129 +63,137 @@ def extract_name_from_url(url: str) -> str:
 # ==============================================================================
 
 def clean_messages(messages: List[Any]) -> List[Any]:
-    """Merge consecutive assistant messages into one.
+    """Merge consecutive assistant messages and ensure valid message order.
 
-    Some LLM APIs (like Qwen/llama.cpp) don't allow consecutive assistant messages.
-    This function merges them by concatenating their content.
+    Some LLM APIs (like Qwen/llama.cpp) don't allow:
+    - Consecutive assistant messages
+    - Messages ending with multiple assistant messages
+
+    This function merges consecutive assistant messages by concatenating content.
+    Also handles LangChain AIMessage, HumanMessage, etc. objects.
     """
     if not messages:
         return messages
 
+    def get_role(msg) -> str:
+        """Extract role from dict or LangChain message object."""
+        if isinstance(msg, dict):
+            return msg.get("role", "unknown")
+        # LangChain message types
+        msg_type = getattr(msg, "type", None)
+        if msg_type:
+            # Map LangChain types to roles
+            type_to_role = {
+                "human": "user",
+                "ai": "assistant",
+                "system": "system",
+                "tool": "tool",
+            }
+            return type_to_role.get(msg_type, msg_type)
+        return getattr(msg, "role", "unknown")
+
+    def get_content(msg) -> str:
+        """Extract content from dict or LangChain message object."""
+        if isinstance(msg, dict):
+            return msg.get("content", "") or ""
+        return getattr(msg, "content", "") or ""
+
+    def set_content(msg, content: str):
+        """Set content on dict or LangChain message object."""
+        if isinstance(msg, dict):
+            msg["content"] = content
+        else:
+            msg.content = content
+
     cleaned = []
     for msg in messages:
-        # Handle both dict format and LangChain message objects
-        if isinstance(msg, dict):
-            msg_type = msg.get("role", "unknown")
-            msg_content = msg.get("content", "")
-        else:
-            msg_type = getattr(msg, "type", None) or getattr(msg, "role", "unknown")
-            msg_content = getattr(msg, "content", "")
+        msg_role = get_role(msg)
+        msg_content = get_content(msg)
 
         # Check if we need to merge with previous message
         if cleaned:
             prev_msg = cleaned[-1]
-            if isinstance(prev_msg, dict):
-                prev_type = prev_msg.get("role", "unknown")
-            else:
-                prev_type = getattr(prev_msg, "type", None) or getattr(prev_msg, "role", "unknown")
+            prev_role = get_role(prev_msg)
 
             # Merge consecutive assistant messages
-            if prev_type == "assistant" and msg_type == "assistant":
-                if isinstance(prev_msg, dict):
-                    prev_msg["content"] = f"{prev_msg.get('content', '')}\n{msg_content}"
-                else:
-                    prev_msg.content = f"{prev_msg.content}\n{msg_content}"
+            if prev_role == "assistant" and msg_role == "assistant":
+                prev_content = get_content(prev_msg)
+                set_content(prev_msg, f"{prev_content}\n{msg_content}")
+                log.debug("Merged consecutive assistant messages")
+                continue
+
+            # Also merge consecutive user messages (some APIs don't like this either)
+            if prev_role == "user" and msg_role == "user":
+                prev_content = get_content(prev_msg)
+                set_content(prev_msg, f"{prev_content}\n\n{msg_content}")
+                log.debug("Merged consecutive user messages")
                 continue
 
         cleaned.append(msg)
 
+    # Final pass: ensure we don't end with multiple assistant messages
+    # (should already be handled by merge above, but double-check)
+    while len(cleaned) >= 2:
+        if get_role(cleaned[-1]) == "assistant" and get_role(cleaned[-2]) == "assistant":
+            # Merge last two messages
+            last = cleaned.pop()
+            second_last = cleaned[-1]
+            set_content(second_last, f"{get_content(second_last)}\n{get_content(last)}")
+            log.debug("Merged trailing assistant messages")
+        else:
+            break
+
     return cleaned
 
 
-# ==============================================================================
-# Logging Callback Handler
-# ==============================================================================
+def estimate_tokens(messages: List[Any]) -> int:
+    """Estimate token count for messages (rough: 4 chars per token)."""
+    total = 0
+    for msg in messages:
+        if isinstance(msg, dict):
+            content = msg.get("content", "")
+        else:
+            content = getattr(msg, "content", "")
+        total += len(str(content)) // 4 + 10  # +10 for message metadata overhead
+    return total
 
-class DeepAgentLoggingHandler(BaseCallbackHandler):
-    """Custom callback handler for detailed Deep Agent logging.
 
-    Tracks:
-    - Chain/agent start/end with timing
-    - LLM calls and token usage
-    - Tool invocations
-    - Errors
+def trim_messages(messages: List[Any], max_tokens: int = 24000) -> List[Any]:
+    """Trim old messages to keep within token budget.
+
+    Always keeps:
+    - First user message (the task)
+    - Most recent messages (the active context)
+
+    Removes middle messages if needed.
     """
+    if not messages:
+        return messages
 
-    def __init__(self, prefix: str = ""):
-        self.start_times: Dict[str, float] = {}
-        self.chain_depth: int = 0
-        self.prefix = prefix
+    current_tokens = estimate_tokens(messages)
+    if current_tokens <= max_tokens:
+        return messages
 
-    def _indent(self) -> str:
-        return "  " * self.chain_depth
+    log.debug("Trimming messages", before=current_tokens, after=max_tokens)
 
-    def on_chain_start(self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        self.start_times[run_id] = time.time()
+    # Always keep first user message (the task)
+    first_msg = messages[0]
+    remaining = messages[1:]
 
-        name = "unnamed"
-        if serialized and isinstance(serialized, dict):
-            name = serialized.get("name", kwargs.get("name", "unnamed"))
-        elif kwargs.get("name"):
-            name = kwargs["name"]
-        self.chain_depth += 1
-        logger.info(f"{self.prefix}{self._indent()}┌─ CHAIN START: {name}")
+    # Keep most recent messages that fit
+    trimmed = [first_msg]
+    recent = []
 
-    def on_chain_end(self, outputs: Dict[str, Any], **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        duration = time.time() - self.start_times.pop(run_id, time.time())
-        logger.info(f"{self.prefix}{self._indent()}└─ CHAIN END ({duration:.2f}s)")
-        self.chain_depth = max(0, self.chain_depth - 1)
+    for msg in reversed(remaining):
+        recent.insert(0, msg)
+        test_messages = trimmed + recent
+        if estimate_tokens(test_messages) > max_tokens:
+            recent.pop(0)  # Remove the one that pushed us over
+            break
 
-    def on_chain_error(self, error: Exception, **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        self.start_times.pop(run_id, None)
-        logger.error(f"{self.prefix}{self._indent()}💥 CHAIN ERROR: {error}")
-        self.chain_depth = max(0, self.chain_depth - 1)
-
-    def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        self.start_times[run_id] = time.time()
-        model = kwargs.get("invocation_params", {}).get("model", "unknown")
-        logger.info(f"{self.prefix}{self._indent()}🤖 LLM START: {model}")
-
-    def on_llm_end(self, response: LLMResult, **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        duration = time.time() - self.start_times.pop(run_id, time.time())
-        token_usage = response.llm_output.get("token_usage", {}) if response.llm_output else {}
-        total_tokens = token_usage.get("total_tokens", "N/A")
-        logger.info(f"{self.prefix}{self._indent()}✅ LLM END ({duration:.2f}s, {total_tokens} tokens)")
-
-    def on_llm_error(self, error: Exception, **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        self.start_times.pop(run_id, None)
-        logger.error(f"{self.prefix}{self._indent()}💥 LLM ERROR: {error}")
-
-    def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        self.start_times[run_id] = time.time()
-        tool_name = "unknown"
-        if serialized and isinstance(serialized, dict):
-            tool_name = serialized.get("name", kwargs.get("name", "unknown"))
-        elif kwargs.get("name"):
-            tool_name = kwargs["name"]
-        logger.info(f"{self.prefix}{self._indent()}🔧 TOOL START: {tool_name}")
-
-    def on_tool_end(self, output: Any, **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        duration = time.time() - self.start_times.pop(run_id, time.time())
-        output_str = str(output)[:150] + "..." if len(str(output)) > 150 else str(output)
-        logger.info(f"{self.prefix}{self._indent()}✅ TOOL END ({duration:.2f}s): {output_str}")
-
-    def on_tool_error(self, error: Exception, **kwargs) -> None:
-        run_id = str(kwargs.get("run_id", "unknown"))
-        self.start_times.pop(run_id, None)
-        logger.error(f"{self.prefix}{self._indent()}💥 TOOL ERROR: {error}")
+    result = trimmed + recent
+    log.debug("Messages trimmed", before=len(messages), after=len(result), tokens=estimate_tokens(result))
+    return result
 
 
 # ==============================================================================
@@ -238,7 +251,6 @@ class DeepAgentGenerator:
     def __init__(
         self,
         config: GeneratorConfig,
-        log_prefix: str = "[DeepAgent]",
         default_prompts: Optional[AgentPrompts] = None,
     ):
         # Set prompts if not already set
@@ -246,19 +258,60 @@ class DeepAgentGenerator:
             config = config.model_copy(update={"prompts": default_prompts})
 
         self.config = config
-        self.log_prefix = log_prefix
+        self.log = log.bind(url=url if (url := config.url) else "unknown")
 
         # Ensure prompts are set
         if config.prompts is None:
-            raise ValueError(f"{log_prefix} config.prompts must be set")
+            raise ValueError("config.prompts must be set")
 
-    def _create_llm(self) -> ChatOpenAI:
-        """Create LLM instance."""
+    def _create_llm(self, enable_thinking: Optional[bool] = None, model: Optional[str] = None, temperature: Optional[float] = None) -> ChatOpenAI:
+        """Create LLM instance with optional reasoning/thinking mode.
+
+        Different providers/models use different parameters to control thinking:
+        - llama.cpp (Qwen): extra_body.chat_template_kwargs.enable_thinking
+        - llama.cpp (DeepSeek-R1): reasoning_effort
+        - OpenAI o1/o3: reasoning_effort
+
+        Args:
+            enable_thinking: Enable thinking/reasoning mode.
+                             Defaults to config.enable_thinking if not specified.
+            model: Model name to use. Defaults to config.model.
+            temperature: Temperature to use. Defaults to config.temperature.
+
+        Returns:
+            ChatOpenAI instance configured with reasoning mode
+        """
+        thinking = enable_thinking if enable_thinking is not None else self.config.enable_thinking
+        model_name = model or self.config.model
+        temp = temperature if temperature is not None else self.config.temperature
+
+        # Build provider-specific reasoning parameters
+        extra_kwargs: Dict[str, Any] = {}
+        model_lower = model_name.lower()
+
+        # Qwen models via llama.cpp use enable_thinking in chat-template-kwargs
+        if "qwen" in model_lower:
+            extra_kwargs["extra_body"] = {
+                "chat_template_kwargs": {
+                    "enable_thinking": thinking
+                }
+            }
+        # DeepSeek-R1, o1, o3 use reasoning_effort
+        elif any(x in model_lower for x in ["deepseek-r1", "deepseek-reasoner", "o1-", "o3-"]):
+            extra_kwargs["reasoning_effort"] = "high" if thinking else "low"
+        # Other models: no thinking parameter needed
+
+        # Get Langfuse callback handler for automatic tracing
+        from ..utils.observability import get_langfuse_callback
+        callbacks = get_langfuse_callback()
+
         return ChatOpenAI(
-            model=self.config.model,
-            temperature=self.config.temperature,
+            model=model_name,
+            temperature=temp,
             api_key=self.config.api_key,
             base_url=self.config.base_url,
+            callbacks=callbacks if callbacks else None,
+            **extra_kwargs,
         )
 
     def _create_subagent(self, tools: List) -> Optional[SubAgent]:
@@ -279,6 +332,7 @@ class DeepAgentGenerator:
         url: str,
         output_path: Optional[Path] = None,
         progress_callback: Optional[Callable] = None,
+        output_is_dir: bool = False,
     ) -> GeneratorResult:
         """Run the Deep Agent generation.
 
@@ -286,37 +340,63 @@ class DeepAgentGenerator:
             url: Target URL to process
             output_path: Output file/directory path (defaults to config.output_dir)
             progress_callback: Optional callback(message, percent)
+            output_is_dir: If True, output_path is a directory (for skill packages).
+                          If False (default), output_path is a file (for llms.txt).
 
         Returns:
             GeneratorResult with output path and stats
         """
-        output_path = Path(output_path or self.config.output_dir)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Initialize Langfuse for automatic LLM tracing
+        init_langfuse()
 
-        logger.info(f"{self.log_prefix} Starting generation for {url}")
-        logger.info(f"{self.log_prefix} Output: {output_path}")
+        # Create session ID to group all traces for this run
+        session_id = create_session_id()
+        self.log.info("Session created", session_id=session_id)
+
+        output_path = Path(output_path or self.config.output_dir)
+        if output_is_dir:
+            output_path.mkdir(parents=True, exist_ok=True)
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log = log.bind(url=url)
+
+        self.log.start("generation", output_path=str(output_path), session_id=session_id)
 
         if progress_callback:
             progress_callback("Connecting to MCP server...", 5)
+
+        # Create store FIRST so we can add search tools
+        store = create_store(
+            embedding_base_url=self.config.embedding_base_url,
+            embedding_model=self.config.embedding_model,
+            embedding_dims=self.config.embedding_dims,
+        )
+        if store:
+            self.log.info("Store created", purpose="content_persistence")
 
         # Connect to MCP and get tools
         async with get_mcp_tools(
             self.config.mcp_host,
             self.config.mcp_port,
+            url=self.config.mcp_url,
             max_urls=self.config.max_urls,
         ) as all_tools:
             main_tools = filter_tools_by_name(all_tools, MAIN_AGENT_TOOL_NAMES)
             subagent_tools = filter_tools_by_name(all_tools, SUBAGENT_TOOL_NAMES)
 
-            logger.info(f"{self.log_prefix} Main tools: {[t.name for t in main_tools]}")
-            logger.info(f"{self.log_prefix} Subagent tools: {[t.name for t in subagent_tools]}")
+            # Add store search tools if store is configured
+            if store:
+                main_tools = list(main_tools) + [search_docs, get_doc_by_url]
+                self.log.info("Store search tools added")
+
+            self.log.debug("Tools configured", main=[t.name for t in main_tools], subagent=[t.name for t in subagent_tools])
 
             if progress_callback:
                 progress_callback("Building agents...", 10)
 
             # Create LLM
             llm = self._create_llm()
-            logger.info(f"{self.log_prefix} Using LLM: {self.config.model}")
+            self.log.info("LLM initialized", model=self.config.model)
 
             # Create subagent
             subagent = self._create_subagent(subagent_tools)
@@ -325,16 +405,55 @@ class DeepAgentGenerator:
             # Format system prompt with context
             system_prompt = self._format_system_prompt(url, output_path)
 
-            # Create filesystem backend
-            fs_backend = FilesystemBackend(root_dir=str(output_path.parent))
+            # Create backends:
+            # - FilesystemBackend for writing output files
+            # - DocsBackend for reading scraped content via semantic search
+            # Use virtual_mode=True so LLM paths like "/llms.txt" resolve to root_dir
+            # For directory output (skills), root_dir is output_path itself
+            # For file output (llms.txt), root_dir is output_path.parent
+            root_dir = output_path if output_is_dir else output_path.parent
+            fs_backend = FilesystemBackend(
+                root_dir=str(root_dir),
+                virtual_mode=True
+            )
+            docs_backend = DocsBackend(store=store)
+            backend = CompositeBackend(
+                default=fs_backend,
+                routes={"/docs/": docs_backend}
+            )
+            self.log.info("CompositeBackend created", routes=["/docs/ -> semantic_search"])
 
-            # Create generator agent
-            generator_agent = create_deep_agent(
+            # Create generator agent with filesystem middleware for backend access
+            generator_agent = create_agent(
                 model=llm,
                 tools=main_tools,
-                subagents=subagents,
                 system_prompt=system_prompt,
-                backend=fs_backend,
+                middleware=[
+                    FilesystemMiddleware(backend=backend),
+                ],
+            )
+
+            # Create synthesis agent with ONLY filesystem tools (no scraping)
+            # This prevents synthesis from calling map_domain/scrape_url
+            # Use virtual path format since fs_backend uses virtual_mode=True
+            # For directory output (skills), use "/" since root_dir is already the target directory
+            # For file output (llms.txt), use the filename
+            virtual_output_path = "/" if output_is_dir else f"/{output_path.name}"
+            synthesis_agent = create_agent(
+                model=llm,
+                tools=[],  # No scraping tools - only filesystem middleware
+                system_prompt=f"""You are an output file generator. Your ONLY job is to write the output file.
+
+You will receive page summaries and must write a properly formatted output file.
+Use the write_file tool to create the output file.
+
+Output path: {virtual_output_path}
+Target URL: {url}
+
+DO NOT use any scraping tools. Just write the output file based on the summaries provided.""",
+                middleware=[
+                    FilesystemMiddleware(backend=fs_backend),  # Only filesystem, no docs backend
+                ],
             )
 
             if progress_callback:
@@ -342,63 +461,104 @@ class DeepAgentGenerator:
 
             # Build the appropriate graph based on config
             if self.config.enable_parallel:
-                logger.info(f"{self.log_prefix} Using PARALLEL scraping (max_concurrent={self.config.max_concurrent})")
-                # Get scrape tool for parallel workers
+                self.log.info("Using PARALLEL scraping", max_concurrent=self.config.max_concurrent)
+                # Get tools for parallel workers
                 scrape_tool = filter_tools_by_name(all_tools, ["scrape_url"])[0] if filter_tools_by_name(all_tools, ["scrape_url"]) else None
-                if scrape_tool:
-                    graph = self._build_parallel_graph(generator_agent, llm, output_path, url, scrape_tool)
+                map_domain_tool = filter_tools_by_name(all_tools, ["map_domain"])[0] if filter_tools_by_name(all_tools, ["map_domain"]) else None
+                if scrape_tool and map_domain_tool:
+                    graph = self._build_parallel_graph(generator_agent, synthesis_agent, llm, output_path, url, scrape_tool, map_domain_tool)
                 else:
-                    logger.warning(f"{self.log_prefix} scrape_url tool not found, falling back to serial mode")
+                    self.log.warning("Required tools not found, falling back to serial mode")
                     graph = self._build_graph(generator_agent, llm, output_path, url)
             else:
-                logger.info(f"{self.log_prefix} Using SERIAL scraping (conversational)")
+                self.log.info("Using SERIAL scraping", mode="conversational")
                 graph = self._build_graph(generator_agent, llm, output_path, url)
-
-            # Create store for full content with real-time embeddings
-            # Requires embedding server running (e.g., llama.cpp router mode with embed model)
-            store = create_store(
-                embedding_base_url=self.config.embedding_base_url,
-                embedding_model=self.config.embedding_model,
-                embedding_dims=self.config.embedding_dims,
-            )
 
             # Run the graph
             initial_message = self._format_initial_message(url, output_path)
-            logger.info(f"{self.log_prefix} Running generator → critic loop...")
-
-            logging_handler = DeepAgentLoggingHandler(self.log_prefix)
+            self.log.start("generator_critic_loop")
 
             # Build config with store (if available)
             invoke_config = {
-                "callbacks": [logging_handler],
                 "configurable": {},
             }
             if store:
                 invoke_config["configurable"]["store"] = store
-                logger.info(f"{self.log_prefix} Store enabled for content persistence")
+                self.log.info("Store enabled for content persistence")
 
-            result = await graph.ainvoke(
-                {
-                    "messages": [{"role": "user", "content": initial_message}],
-                    "url": url,
-                    "output_path": str(output_path),
-                    "current_round": 0,
-                    "max_rounds": self.config.max_rounds,
-                    "critic_passed": False,
-                    "critic_score": 0.0,
-                    "critic_feedback": [],
-                    "context": self.config.context,
-                    # Parallel scraping state
-                    "discovered_urls": [],
-                    "scraped_docs": [],
-                    "scraping_errors": [],
-                    "scraping_complete": False,
-                },
-                config=invoke_config
-            )
+            # Wrap invocation with session propagation for Langfuse
+            try:
+                from langfuse import propagate_attributes
+                with propagate_attributes(session_id=session_id):
+                    result = await graph.ainvoke(
+                        {
+                            "messages": [{"role": "user", "content": initial_message}],
+                            "url": url,
+                            "output_path": str(output_path),
+                            "current_round": 0,
+                            "max_rounds": self.config.max_rounds,
+                            "critic_passed": False,
+                            "critic_score": 0.0,
+                            "critic_feedback": [],
+                            "context": self.config.context,
+                            # Parallel scraping state
+                            "discovered_urls": [],
+                            "scraped_docs": [],
+                            "scraping_errors": [],
+                            "scraping_complete": False,
+                        },
+                        config=invoke_config
+                    )
+            except ImportError:
+                # Fallback if propagate_attributes not available
+                result = await graph.ainvoke(
+                    {
+                        "messages": [{"role": "user", "content": initial_message}],
+                        "url": url,
+                        "output_path": str(output_path),
+                        "current_round": 0,
+                        "max_rounds": self.config.max_rounds,
+                        "critic_passed": False,
+                        "critic_score": 0.0,
+                        "critic_feedback": [],
+                        "context": self.config.context,
+                        # Parallel scraping state
+                        "discovered_urls": [],
+                        "scraped_docs": [],
+                        "scraping_errors": [],
+                        "scraping_complete": False,
+                    },
+                    config=invoke_config
+                )
+            except Exception as e:
+                # If generation failed but file exists, use it (best effort)
+                if output_path.exists() and (output_path.is_file() or output_path.is_dir()):
+                    self.log.warning(
+                        "best_effort_output",
+                        f"Generation failed but output exists - using best effort (error: {e})",
+                        output_path=str(output_path)
+                    )
+                    # Create a result indicating partial success
+                    return GeneratorResult(
+                        output_path=output_path,
+                        stats={
+                            "file_size": output_path.read_text().__len__() if output_path.is_file() else 0,
+                            "critic_passed": False,
+                            "critic_score": 0.0,
+                            "rounds": self.config.max_rounds,
+                            "best_effort": True,
+                            "error": str(e),
+                        },
+                    )
+                # No output file - re-raise the exception
+                raise
 
             if progress_callback:
                 progress_callback("Generation complete", 100)
+
+            # Flush observability events before returning
+            flush_langfuse()
+            self.log.info("Traces flushed to Langfuse", session_id=session_id)
 
             # Check output
             return self._create_result(output_path, result)
@@ -415,7 +575,7 @@ class DeepAgentGenerator:
         try:
             return prompts.generator_system.format(**context)
         except KeyError as e:
-            logger.warning(f"{self.log_prefix} Missing context key in prompt: {e}")
+            self.log.warning("Missing context key in prompt", key=str(e))
             return prompts.generator_system
 
     def _format_initial_message(self, url: str, output_path: Path) -> str:
@@ -429,7 +589,7 @@ class DeepAgentGenerator:
         try:
             return prompts.generator_initial.format(**context)
         except KeyError as e:
-            logger.warning(f"{self.log_prefix} Missing context key in initial message: {e}")
+            self.log.warning("Missing context key in initial message", key=str(e))
             return prompts.generator_initial
 
     def _format_feedback_message(self, feedback: List[str]) -> str:
@@ -446,23 +606,26 @@ class DeepAgentGenerator:
             max_rounds = state.get("max_rounds", 3)
 
             if current_round >= max_rounds:
-                logger.warning(f"{self.log_prefix} Max rounds ({max_rounds}) reached")
+                self.log.warning("Max rounds reached", max_rounds=max_rounds)
                 return END
 
             critic_passed = state.get("critic_passed", False)
             if critic_passed:
-                logger.info(f"{self.log_prefix} Critic APPROVED")
+                self.log.info("Critic approved")
                 return END
 
             return "generator"
 
         async def generator_node(state: dict) -> dict:
-            """Run generator with message cleaning for Qwen compatibility."""
+            """Run generator with message cleaning and trimming for context management."""
             messages = state.get("messages", [])
+            # First clean (merge consecutive messages)
             cleaned = clean_messages(messages)
-            if len(cleaned) != len(messages):
-                logger.debug(f"{self.log_prefix} Cleaned {len(messages)} -> {len(cleaned)} messages")
-            result = await generator_agent.ainvoke({**state, "messages": cleaned})
+            # Then trim to token budget to prevent context overflow
+            trimmed = trim_messages(cleaned, max_tokens=24000)
+            if len(trimmed) != len(messages):
+                self.log.debug("Messages managed", original=len(messages), cleaned=len(cleaned), trimmed=len(trimmed))
+            result = await generator_agent.ainvoke({**state, "messages": trimmed})
             return result
 
         async def critic_node(state: dict) -> dict:
@@ -474,9 +637,12 @@ class DeepAgentGenerator:
                 state, output_path, url, current_round
             )
 
-            logger.info(
-                f"{self.log_prefix} Critic round {current_round}: "
-                f"passed={passed}, score={score:.2f}, issues={len(feedback)}"
+            self.log.info(
+                "Critic evaluation",
+                round=current_round,
+                passed=passed,
+                score=f"{score:.2f}",
+                issues=len(feedback)
             )
 
             if not passed:
@@ -485,6 +651,8 @@ class DeepAgentGenerator:
                 messages = state.get("messages", [])
                 messages = list(messages) + [{"role": "user", "content": feedback_msg}]
                 messages = clean_messages(messages)
+                # Trim to prevent context overflow across rounds
+                messages = trim_messages(messages, max_tokens=24000)
 
                 return {
                     **state,
@@ -515,10 +683,12 @@ class DeepAgentGenerator:
     def _build_parallel_graph(
         self,
         generator_agent,
+        synthesis_agent,
         llm: ChatOpenAI,
         output_path: Path,
         url: str,
         scrape_tool,
+        map_domain_tool=None,
     ) -> StateGraph:
         """Build graph with parallel scraping via Send (Map-Reduce pattern).
 
@@ -533,19 +703,35 @@ class DeepAgentGenerator:
         """
         max_concurrent = self.config.max_concurrent or 5
         max_content = self.config.max_content_per_doc
-        log_prefix = self.log_prefix
+        scoped_log = self.log
 
         # Semaphore for explicit concurrency limiting
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        # Fast LLM for structured summarization (cheaper model)
-        fast_llm = ChatOpenAI(
-            model=self.config.fast_model,
-            temperature=self.config.fast_model_temperature,
-            api_key=self.config.api_key,
-            base_url=self.config.base_url,
+        # Fast LLM for structured summarization (use main model if fast_model not set)
+        # Thinking DISABLED for subagents - they do simple summarization
+        fast_model_name = self.config.fast_model or self.config.model
+        fast_llm = self._create_llm(
+            enable_thinking=False,
+            model=fast_model_name,
+            temperature=self.config.fast_model_temperature
         )
         structured_llm = fast_llm.with_structured_output(PageSummary)
+
+        # Create discovery agent with ONLY map_domain tool
+        # This prevents the agent from scraping during discovery
+        discovery_tools = [map_domain_tool] if map_domain_tool else []
+        discovery_agent = create_agent(
+            model=llm,
+            tools=discovery_tools,
+            system_prompt=f"""You are a URL discovery agent. Your ONLY job is to discover URLs on a website.
+
+Use the map_domain tool to discover all URLs on the target website.
+
+Return the list of discovered URLs. Do NOT scrape any pages - just discover them.
+
+Target website: {url}""",
+        )
 
         # Bind static methods for use in nested functions
         extract_urls = self._extract_urls_from_messages
@@ -557,21 +743,26 @@ class DeepAgentGenerator:
             max_rounds = state.get("max_rounds", 3)
 
             if current_round >= max_rounds:
-                logger.warning(f"{log_prefix} Max rounds ({max_rounds}) reached")
+                scoped_log.warning("Max rounds reached", max_rounds=max_rounds)
                 return END
 
             critic_passed = state.get("critic_passed", False)
             if critic_passed:
-                logger.info(f"{log_prefix} Critic APPROVED")
+                scoped_log.info("Critic approved")
                 return END
 
             return "discovery"
 
         async def discovery_node(state: dict) -> dict:
-            """Run generator to discover URLs via map_domain."""
+            """Run discovery agent to discover URLs via map_domain ONLY."""
             messages = state.get("messages", [])
-            cleaned = clean_messages(messages)
-            result = await generator_agent.ainvoke({**state, "messages": cleaned})
+
+            # Simple message for discovery
+            discovery_message = f"Discover all URLs on {url} using map_domain."
+
+            result = await discovery_agent.ainvoke({
+                "messages": [{"role": "user", "content": discovery_message}],
+            })
 
             # Extract URLs from tool responses
             urls = extract_urls(result.get("messages", []))
@@ -579,10 +770,10 @@ class DeepAgentGenerator:
             # Apply max_urls limit
             max_urls = self.config.max_urls
             if max_urls and len(urls) > max_urls:
-                logger.info(f"{log_prefix} Limiting URLs from {len(urls)} to {max_urls}")
+                scoped_log.info("URLs limited", before=len(urls), after=max_urls)
                 urls = urls[:max_urls]
 
-            logger.info(f"{log_prefix} Discovered {len(urls)} URLs for parallel scraping")
+            scoped_log.info("URLs discovered", count=len(urls), parallel_scraping=True)
 
             return {
                 **result,
@@ -590,23 +781,6 @@ class DeepAgentGenerator:
                 "scraped_docs": [],
                 "scraping_errors": [],
             }
-
-        def router_node(state: dict) -> List[Send]:
-            """Fan out to parallel scraper workers."""
-            urls = state.get("discovered_urls", [])
-            if not urls:
-                logger.warning(f"{log_prefix} No URLs discovered, skipping scraping")
-                return []
-
-            logger.info(f"{log_prefix} Fanning out to {len(urls)} scraper workers")
-            return [
-                Send("scraper", {
-                    "url": url,
-                    "output_path": state.get("output_path", ""),
-                    "max_content": max_content,
-                })
-                for url in urls
-            ]
 
         async def scraper_node(state: dict, config: RunnableConfig) -> dict:
             """Scrape a single URL, store full content, return structured summary.
@@ -623,7 +797,7 @@ class DeepAgentGenerator:
             # Use semaphore to limit concurrent scrapers
             async with semaphore:
                 try:
-                    logger.debug(f"{log_prefix} Scraping: {url}")
+                    scoped_log.debug("Scraping URL", url=url)
                     result = await scrape_tool.ainvoke({"url": url})
 
                     # Parse result and extract content
@@ -631,8 +805,9 @@ class DeepAgentGenerator:
 
                     # Store full content with auto-generated embeddings
                     if store:
-                        # Use URL hash as key for deduplication
-                        content_hash = hashlib.md5(f"{url}:{full_content[:1000]}".encode()).hexdigest()
+                        # Normalize content for consistent hashing (whitespace-insensitive)
+                        normalized = " ".join(full_content.split()).lower()
+                        content_hash = hashlib.md5(f"{url}:{normalized}".encode()).hexdigest()
 
                         await store.aput(
                             namespace=("memories", "raw_pages"),
@@ -644,13 +819,13 @@ class DeepAgentGenerator:
                             },
                             index=None,  # Auto-embed using store's embedding config
                         )
-                        logger.debug(f"{log_prefix} Stored {url} (embedded, key={content_hash[:8]}...)")
+                        scoped_log.debug("Content stored", url=url, hash=content_hash[:8], embedded=True)
 
                     # Truncate for LLM if configured (for summary generation)
                     content_for_llm = full_content
                     if max_c and len(full_content) > max_c:
                         content_for_llm = full_content[:max_c]
-                        logger.debug(f"{log_prefix} Truncated {url} to {max_c} chars for summary")
+                        scoped_log.debug("Content truncated", url=url, max_chars=max_c)
 
                     # ACTION 2: Generate structured summary (tiny footprint for state)
                     summary: PageSummary = await structured_llm.ainvoke(
@@ -662,11 +837,11 @@ class DeepAgentGenerator:
                     # Ensure URL is set correctly (in case LLM makes mistakes)
                     summary.url = url
 
-                    logger.info(f"{log_prefix} Scraped {url} → {summary.title} ({len(full_content)} chars)")
+                    scoped_log.info("Page scraped", url=url, title=summary.title, content_chars=len(full_content))
                     return {"scraped_docs": [summary.model_dump()]}
 
                 except Exception as e:
-                    logger.error(f"{log_prefix} Failed to scrape {url}: {e}")
+                    scoped_log.error("Scrape failed", url=url, error=str(e))
                     return {"scraping_errors": [f"{url}: {str(e)}"]}
 
         async def synthesis_node(state: dict) -> dict:
@@ -674,20 +849,20 @@ class DeepAgentGenerator:
             docs = state.get("scraped_docs", [])
             errors = state.get("scraping_errors", [])
 
-            logger.info(f"{log_prefix} Synthesis: {len(docs)} docs, {len(errors)} errors")
+            scoped_log.info("Synthesis starting", docs_count=len(docs), errors_count=len(errors))
 
-            # Format scraped content for LLM
+            # Format scraped content for LLM (compact format)
             context = format_docs(docs, errors)
 
-            # Create synthesis prompt
-            synthesis_message = self._format_synthesis_message(context, output_path)
+            # Create synthesis prompt (no URL list - summaries already have URLs)
+            synthesis_message = self._format_synthesis_message(context, output_path, url)
 
-            # Run generator with synthesis context
-            messages = state.get("messages", [])
-            messages = list(messages) + [{"role": "user", "content": synthesis_message}]
+            # Run synthesis agent (only has write_file tool, no scraping)
+            # Start fresh - only keep synthesis message to avoid context overflow
+            messages = [{"role": "user", "content": synthesis_message}]
             messages = clean_messages(messages)
 
-            result = await generator_agent.ainvoke({**state, "messages": messages})
+            result = await synthesis_agent.ainvoke({**state, "messages": messages})
             return result
 
         async def critic_node(state: dict) -> dict:
@@ -698,9 +873,12 @@ class DeepAgentGenerator:
                 state, output_path, url, current_round
             )
 
-            logger.info(
-                f"{log_prefix} Critic round {current_round}: "
-                f"passed={passed}, score={score:.2f}, issues={len(feedback)}"
+            scoped_log.info(
+                "Critic evaluation",
+                round=current_round,
+                passed=passed,
+                score=f"{score:.2f}",
+                issues=len(feedback)
             )
 
             if not passed:
@@ -708,6 +886,8 @@ class DeepAgentGenerator:
                 messages = state.get("messages", [])
                 messages = list(messages) + [{"role": "user", "content": feedback_msg}]
                 messages = clean_messages(messages)
+                # Trim to prevent context overflow across rounds
+                messages = trim_messages(messages, max_tokens=24000)
 
                 return {
                     **state,
@@ -730,40 +910,84 @@ class DeepAgentGenerator:
                 "critic_feedback": [],
             }
 
+        def route_to_scrapers(state: dict):
+            """Conditional edge that fans out to parallel scrapers via Send."""
+            urls = state.get("discovered_urls", [])
+            if not urls:
+                scoped_log.warning("No URLs discovered, going to synthesis")
+                return "synthesis"
+
+            scoped_log.info("Fanning out to scrapers", worker_count=len(urls))
+            return [
+                Send("scraper", {
+                    "url": url,
+                    "output_path": state.get("output_path", ""),
+                    "max_content": max_content,
+                })
+                for url in urls
+            ]
+
         # Build graph with specialized state for web scraping
         graph = StateGraph(WebScrapingState)
         graph.add_node("discovery", discovery_node)
-        graph.add_node("router", router_node)
         graph.add_node("scraper", scraper_node)
         graph.add_node("synthesis", synthesis_node)
         graph.add_node("critic", critic_node)
 
         # Wire up the flow
         graph.set_entry_point("discovery")
-        # If URLs discovered, go to router (which fans out), else skip to synthesis
-        graph.add_conditional_edges(
-            "discovery",
-            lambda s: "router" if s.get("discovered_urls") else "synthesis"
-        )
-        # router fans out to scrapers via Send (handled automatically by returning List[Send])
-        graph.add_edge("scraper", "synthesis")  # All scrapers converge to synthesis
+        # Conditional edge: fan out to scrapers or go directly to synthesis
+        graph.add_conditional_edges("discovery", route_to_scrapers, ["synthesis"])
+        # All scrapers converge to synthesis
+        graph.add_edge("scraper", "synthesis")
         graph.add_edge("synthesis", "critic")
         graph.add_conditional_edges("critic", should_continue)
 
         return graph.compile()
 
-    def _format_synthesis_message(self, context: str, output_path: Path) -> str:
+    def _format_synthesis_message(self, context: str, output_path: Path, url: str = None) -> str:
         """Format the synthesis prompt. Override in subclasses for customization."""
-        return f"""Generate the output file based on the scraped page summaries below.
+        # FilesystemBackend uses virtual_mode=True with root_dir=output_path.parent
+        # Use virtual path format: /filename resolves to root_dir/filename
+        virtual_path = f"/{output_path.name}"
+        return f"""Generate the llms.txt file for {url}.
 
-Output file: {output_path}
+Write to: {virtual_path}
 
-Scraped page summaries:
----
+## llms.txt Format
+
+Use this exact format:
+
+```
+# Project Name
+
+> One-line summary of the project.
+
+## Section Name
+
+- [Specific Title](URL): Informative description ending with a period.
+- [Another Title](URL): Another clear description here.
+
+## Optional
+
+- [Non-essential Link](URL): Optional resource description.
+```
+
+## Format Rules
+
+1. **H1 Header**: Project NAME (not URL) at top
+2. **Blockquote Summary**: One-line summary after H1 using `>`
+3. **Links**: Use `- [Title](URL): Description.` format
+4. **Titles**: 2-5 words, specific (NOT "Home", "Page", "About")
+5. **Descriptions**: 5-12 words, informative, end with period
+6. **No Placeholders**: Never use "No description" or "N/A"
+7. **Sections**: Group URLs under H2 headers (`##`)
+8. **Optional Section**: Put blogs, changelogs under `## Optional`
+
+Page summaries to include:
 {context}
----
 
-Use write_file to create the output file with the appropriate content."""
+Use write_file to create the output file with ALL pages included."""
 
     # ==============================================================================
     # Helper functions for parallel scraping
@@ -782,6 +1006,11 @@ Use write_file to create the output file with the appropriate content."""
 
             if not content:
                 continue
+
+            # Handle MCP tool response format: [{'type': 'text', 'text': '...'}]
+            if isinstance(content, list) and content and isinstance(content[0], dict):
+                if "text" in content[0]:
+                    content = content[0]["text"]
 
             # Try to parse as JSON (map_domain returns JSON)
             try:
@@ -843,32 +1072,21 @@ Use write_file to create the output file with the appropriate content."""
     def _format_scraped_docs_for_synthesis(docs: List[Dict], errors: List[str]) -> str:
         """Format scraped docs for the synthesis LLM.
 
-        Works with PageSummary format (url, title, description, key_topics).
-        This creates a compact representation for synthesis without context explosion.
+        Compact format to avoid context explosion.
         """
-        parts = []
+        lines = []
 
-        if docs:
-            parts.append(f"=== {len(docs)} Scraped Pages (Summaries) ===\n")
-            for i, doc in enumerate(docs, 1):
-                url = doc.get("url", "unknown")
-                title = doc.get("title", "Untitled")
-                description = doc.get("description", "No description")
-                topics = doc.get("key_topics", [])
-                topics_str = ", ".join(topics) if topics else "N/A"
-                parts.append(
-                    f"--- Page {i}: {title} ---\n"
-                    f"URL: {url}\n"
-                    f"Description: {description}\n"
-                    f"Topics: {topics_str}\n"
-                )
+        for doc in docs:
+            url = doc.get("url", "unknown")
+            title = doc.get("title", "Untitled")
+            description = doc.get("description", "No description")
+            # One line per doc: URL | Title | Description
+            lines.append(f"{url} | {title} | {description}")
 
         if errors:
-            parts.append(f"\n=== {len(errors)} Failed Pages ===\n")
-            for err in errors:
-                parts.append(f"- {err}\n")
+            lines.append(f"\nFailed: {len(errors)} pages")
 
-        return "\n".join(parts)
+        return "\n".join(lines)
 
     async def _run_critic(
         self,
@@ -889,18 +1107,43 @@ Use write_file to create the output file with the appropriate content."""
             return False, 0.0, [f"Output file not created at {output_path}"]
 
     def _create_result(self, output_path: Path, result: dict) -> GeneratorResult:
-        """Create GeneratorResult from graph output."""
+        """Create GeneratorResult from graph output.
+
+        Returns a result even if generation failed (critic didn't pass).
+        Check result.stats['critic_passed'] to see if generation succeeded.
+        """
+        critic_passed = result.get("critic_passed", False)
+        critic_score = result.get("critic_score", 0.0)
+        rounds = result.get("current_round", 0)
+
         if output_path.exists():
             content = output_path.read_text() if output_path.is_file() else ""
-            logger.info(f"{self.log_prefix} Generated output ({len(content)} chars)")
+            self.log.info("Output generated", chars=len(content), critic_passed=critic_passed)
             return GeneratorResult(
                 output_path=output_path,
                 stats={
                     "file_size": len(content),
-                    "critic_passed": result.get("critic_passed", False),
-                    "critic_score": result.get("critic_score", 0.0),
-                    "rounds": result.get("current_round", 0),
+                    "critic_passed": critic_passed,
+                    "critic_score": critic_score,
+                    "rounds": rounds,
                 },
             )
         else:
-            raise RuntimeError(f"Generation failed: file not created at {output_path}")
+            # File not created - generation failed
+            self.log.warning(
+                "Output file not created",
+                path=str(output_path),
+                critic_passed=critic_passed,
+                rounds=rounds
+            )
+            # Return result with failure stats instead of raising
+            return GeneratorResult(
+                output_path=output_path,
+                stats={
+                    "file_size": 0,
+                    "critic_passed": False,
+                    "critic_score": critic_score,
+                    "rounds": rounds,
+                    "error": "Output file not created",
+                },
+            )

@@ -17,6 +17,7 @@ dependencies = [
     "loguru>=0.7.0",
     "deepagents>=0.4.7",
     "langchain-mcp-adapters>=0.2.1",
+    "langfuse>=4.0.0",
 ]
 
 [project.scripts]

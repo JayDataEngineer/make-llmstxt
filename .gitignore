@@ -99,6 +99,7 @@ Desktop.ini
 .env.local
 .env.*.local
 .envrc
+docker/langfuse/.env
 
 # Secrets
 *.pem

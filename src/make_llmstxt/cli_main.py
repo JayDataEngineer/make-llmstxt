@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from loguru import logger
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
@@ -25,11 +24,12 @@ from .generators.skill import SkillGenerator
 from .generators.prompts.llmstxt import LLMSTXT_PROMPTS
 from .generators.prompts.skill import SKILL_PROMPTS
 from .__init__ import __version__
-from .utils.logging import setup_logging
+from .utils.logging import setup_logging, StructuredLogger
 from .core import GeneratorConfig
 from .validators import validate_skill_generation
 
 console = Console()
+log = StructuredLogger("cli")
 
 
 def list_providers():
@@ -55,6 +55,7 @@ def handle_llmstxt(args, env_config: AppConfig):
         output_dir=Path(args.output_dir),
         mcp_host=env_config.mcp.host,
         mcp_port=env_config.mcp.port,
+        mcp_url=env_config.mcp.url,
         max_rounds=args.max_rounds,
         pass_threshold=args.pass_threshold,
         api_key=env_config.llm.api_key,
@@ -71,6 +72,20 @@ def handle_llmstxt(args, env_config: AppConfig):
         if args.provider in PROVIDER_PROFILES:
             profile = PROVIDER_PROFILES[args.provider]
             config.model = args.model or profile["default_model"]
+            # Also get base_url from provider settings
+            provider_base_urls = {
+                "openai": None,
+                "anthropic": "https://api.anthropic.com/v1",
+                "deepseek": "https://api.deepseek.com/v1",
+                "openrouter": "https://openrouter.ai/api/v1",
+                "zai": "https://api.z.ai/api/coding/paas/v4",
+                "glm": "https://api.z.ai/api/coding/paas/v4",
+            }
+            if args.provider in provider_base_urls:
+                config.base_url = args.base_url or provider_base_urls[args.provider]
+            # Get API key from correct env var
+            env_key = profile["env_key"]
+            config.api_key = args.api_key or os.getenv(env_key)
     if args.model:
         config.model = args.model
     if args.base_url:
@@ -78,15 +93,34 @@ def handle_llmstxt(args, env_config: AppConfig):
     if args.api_key:
         config.api_key = args.api_key
 
+    # Embedding config for semantic search store
+    # Priority: CLI args > env vars > default (same as base_url for router mode)
+    embedding_base_url = (
+        args.embedding_base_url or
+        os.getenv("EMBEDDING_BASE_URL") or
+        config.base_url  # Default: use same server (router mode)
+    )
+    config.embedding_base_url = embedding_base_url
+    config.embedding_model = args.embedding_model or os.getenv("EMBEDDING_MODEL", "embed")
+    embedding_dims_str = os.getenv("EMBEDDING_DIMS", "1024")
+    config.embedding_dims = args.embedding_dims or int(embedding_dims_str)
+    log.debug(
+        "Embedding config",
+        base_url=config.embedding_base_url,
+        model=config.embedding_model,
+        dims=config.embedding_dims
+    )
+
     # Create generator
     generator = LLMsTxtGenerator(config)
 
+    mcp_display = config.mcp_url or f"{config.mcp_host}:{config.mcp_port}"
     console.print(Panel.fit(
         f"[bold cyan]LLMs.txt Generation[/bold cyan]\n"
         f"URL: {args.url}\n"
         f"Provider: {config.provider}\n"
         f"Model: {config.model}\n"
-        f"MCP: {config.mcp_host}:{config.mcp_port}",
+        f"MCP: {mcp_display}",
         title="make-llmstxt",
     ))
 
@@ -114,10 +148,10 @@ def handle_llmstxt(args, env_config: AppConfig):
             console.print(f"  Output: {result.output_path}")
             console.print(f"  Critic passed: {result.stats.get('critic_passed', False)}")
             console.print(f"  Rounds: {result.stats.get('rounds', 0)}")
-            logger.info(f"Generation complete: {result.output_path}")
+            log.info("Generation complete", output_path=str(result.output_path))
 
         except Exception as e:
-            logger.exception(f"Generation failed: {e}")
+            log.error("Generation", f"Failed: {e}")
             console.print(f"[red]Error: {e}[/red]")
             if args.verbose:
                 console.print_exception()
@@ -181,12 +215,41 @@ def handle_skill(args, env_config: AppConfig):
         if args.provider in PROVIDER_PROFILES:
             profile = PROVIDER_PROFILES[args.provider]
             config.model = args.model or profile["default_model"]
+            # Also get base_url from provider settings
+            provider_base_urls = {
+                "openai": None,
+                "anthropic": "https://api.anthropic.com/v1",
+                "deepseek": "https://api.deepseek.com/v1",
+                "openrouter": "https://openrouter.ai/api/v1",
+                "zai": "https://api.z.ai/api/coding/paas/v4",
+                "glm": "https://api.z.ai/api/coding/paas/v4",
+            }
+            if args.provider in provider_base_urls:
+                config.base_url = args.base_url or provider_base_urls[args.provider]
+            # Get API key from correct env var
+            env_key = profile["env_key"]
+            config.api_key = args.api_key or os.getenv(env_key)
     if args.model:
         config.model = args.model
     if args.base_url:
         config.base_url = args.base_url
     if args.api_key:
         config.api_key = args.api_key
+
+    # Embedding config for semantic search store (same as llmstxt mode)
+    embedding_base_url = (
+        args.embedding_base_url or
+        os.getenv("EMBEDDING_BASE_URL") or
+        config.base_url  # Default: use same server (router mode)
+    )
+    log.debug(f"DEBUG: args.embedding_base_url={args.embedding_base_url}")
+    log.debug(f"DEBUG: os.getenv('EMBEDDING_BASE_URL')={os.getenv('EMBEDDING_BASE_URL')}")
+    log.debug(f"DEBUG: config.base_url={config.base_url}")
+    log.debug(f"DEBUG: final embedding_base_url={embedding_base_url}")
+    config.embedding_base_url = embedding_base_url
+    config.embedding_model = args.embedding_model or os.getenv("EMBEDDING_MODEL", "embed")
+    config.embedding_dims = args.embedding_dims or int(os.getenv("EMBEDDING_DIMS", "1024"))
+    log.debug(f"DEBUG: config.embedding_base_url after set={config.embedding_base_url}")
 
     # Create generator
     generator = SkillGenerator(config)
@@ -197,7 +260,7 @@ def handle_skill(args, env_config: AppConfig):
         f"Library: {library_name}\n"
         f"Provider: {config.provider}\n"
         f"Model: {config.model}\n"
-        f"MCP: {config.mcp_host}:{config.mcp_port}",
+        f"MCP: {config.mcp_url or f'{config.mcp_host}:{config.mcp_port}'}",
         title="make-llmstxt",
     ))
 
@@ -224,10 +287,10 @@ def handle_skill(args, env_config: AppConfig):
             console.print(f"[green]✓ Success![/green] Skill package created")
             console.print(f"  Output: {result.output_path}")
             console.print(f"  Files created: {result.stats.get('files_created', 0)}")
-            logger.info(f"Skill package created at {result.output_path}")
+            log.info("Skill package created", output_path=str(result.output_path))
 
         except Exception as e:
-            logger.exception(f"Skill generation failed: {e}")
+            log.error("Skill generation", f"Failed: {e}")
             console.print(f"[red]Error: {e}[/red]")
             if args.verbose:
                 console.print_exception()
@@ -284,6 +347,10 @@ def main():
     llmstxt_parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     llmstxt_parser.add_argument("--log-file", help="Path to log file")
     llmstxt_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")
+    # Embedding config (for semantic search store)
+    llmstxt_parser.add_argument("--embedding-base-url", help="Base URL for embedding API (default: same as base-url)")
+    llmstxt_parser.add_argument("--embedding-model", default="embed", help="Embedding model name (default: embed)")
+    llmstxt_parser.add_argument("--embedding-dims", type=int, default=1024, help="Embedding dimensions (default: 1024)")
 
     # ========== skill mode ==========
     skill_parser = subparsers.add_parser(
@@ -303,6 +370,10 @@ def main():
     skill_parser.add_argument("--log-json", action="store_true", help="Use JSON log format")
     skill_parser.add_argument("--clean", action="store_true", help="Clean output directory before generation")
     skill_parser.add_argument("--validate", action="store_true", help="Run validation checks before generation")
+    # Embedding config (for semantic search store)
+    skill_parser.add_argument("--embedding-base-url", help="Base URL for embedding API (default: same as base-url)")
+    skill_parser.add_argument("--embedding-model", default="embed", help="Embedding model name (default: embed)")
+    skill_parser.add_argument("--embedding-dims", type=int, default=1024, help="Embedding dimensions (default: 1024)")
 
     # Parse arguments
     args = parser.parse_args()
@@ -316,8 +387,7 @@ def main():
     log_json = hasattr(args, 'log_json') and args.log_json
 
     actual_log_file = setup_logging(level=log_level, log_file=log_file, json_format=log_json)
-    logger.info(f"make-llmstxt v{__version__} starting up")
-    logger.info(f"Logs: {actual_log_file}")
+    log.start("make_llmstxt", version=__version__, log_file=str(actual_log_file))
 
     # List providers if requested
     if args.list_providers:
@@ -326,14 +396,14 @@ def main():
 
     # Load environment config
     env_config = AppConfig.from_env()
-    logger.debug(f"Loaded config from env: provider={env_config.llm.provider}")
-    logger.info(f"Using MCP scraper at {env_config.mcp.host}:{env_config.mcp.port}")
+    log.debug("Config loaded", provider=env_config.llm.provider)
+    log.info("MCP scraper configured", host=env_config.mcp.host, port=env_config.mcp.port)
 
     # Check API key
     if not env_config.llm.api_key and env_config.llm.provider != "local":
         console.print(f"[red]Error: LLM API key not provided for provider '{env_config.llm.provider}'[/red]")
         console.print(f"Set the appropriate environment variable or use --api-key")
-        logger.error(f"LLM API key not provided for provider '{env_config.llm.provider}'")
+        log.error("API key", f"Missing for provider: {env_config.llm.provider}")
         sys.exit(1)
 
     # Handle modes

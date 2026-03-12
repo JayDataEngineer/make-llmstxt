@@ -61,11 +61,43 @@ class MCPConfig(BaseModel):
         return f"http://{self.host}:{self.port}/mcp"
 
 
+class LangfuseConfig(BaseModel):
+    """Langfuse observability configuration.
+
+    Uses standard Langfuse env vars:
+    - LANGFUSE_SECRET_KEY
+    - LANGFUSE_PUBLIC_KEY
+    - LANGFUSE_BASE_URL
+
+    Tracing is automatically enabled when both keys are present.
+    """
+
+    enabled: bool = Field(default=False, description="Auto-enabled when keys are set")
+    public_key: Optional[str] = Field(default=None, description="LANGFUSE_PUBLIC_KEY")
+    secret_key: Optional[str] = Field(default=None, description="LANGFUSE_SECRET_KEY")
+    base_url: str = Field(default="http://localhost:3000", description="LANGFUSE_BASE_URL")
+
+    @classmethod
+    def from_env(cls) -> "LangfuseConfig":
+        """Load Langfuse config from environment variables."""
+        secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+        public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+        enabled = bool(secret_key and public_key)
+
+        return cls(
+            enabled=enabled,
+            public_key=public_key,
+            secret_key=secret_key,
+            base_url=os.getenv("LANGFUSE_BASE_URL", "http://localhost:3000"),
+        )
+
+
 class AppConfig(BaseModel):
     """Application configuration."""
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
 
     # Generation settings
     max_urls: Optional[int] = Field(default=None, description="Maximum URLs to process (None = unlimited)")
@@ -109,6 +141,9 @@ class AppConfig(BaseModel):
         config.mcp.port = int(os.getenv("MCP_PORT", "8000"))
         config.mcp.url = os.getenv("MCP_URL")  # Full URL override (e.g., Tailscale Funnel)
 
+        # Langfuse observability config
+        config.langfuse = LangfuseConfig.from_env()
+
         return config
 
     @staticmethod
@@ -119,8 +154,8 @@ class AppConfig(BaseModel):
             "anthropic": "claude-3-haiku-20240307",
             "deepseek": "deepseek-chat",
             "openrouter": "anthropic/claude-3-haiku",
-            "zai": "glm-4.5-air",
-            "glm": "glm-4.5-air",
+            "zai": "glm-4.7",
+            "glm": "glm-4.7",
             "local": "local-model",
         }
         return defaults.get(provider, "gpt-4o-mini")
@@ -132,7 +167,7 @@ PROVIDER_PROFILES = {
     "anthropic": {"env_key": "ANTHROPIC_API_KEY", "default_model": "claude-3-haiku-20240307", "description": "Anthropic Claude"},
     "deepseek": {"env_key": "DEEPSEEK_API_KEY", "default_model": "deepseek-chat", "description": "DeepSeek models"},
     "openrouter": {"env_key": "OPENROUTER_API_KEY", "default_model": "anthropic/claude-3-haiku", "description": "OpenRouter gateway"},
-    "zai": {"env_key": "ZAI_API_KEY", "default_model": "glm-4.5-air", "description": "ZAI GLM models"},
-    "glm": {"env_key": "ZAI_API_KEY", "default_model": "glm-4.5-air", "description": "GLM models"},
+    "zai": {"env_key": "ZAI_API_KEY", "default_model": "glm-4.7", "description": "ZAI GLM models"},
+    "glm": {"env_key": "ZAI_API_KEY", "default_model": "glm-4.7", "description": "GLM models"},
     "local": {"env_key": "LOCAL_API_KEY", "default_model": "local-model", "description": "Local server"},
 }
