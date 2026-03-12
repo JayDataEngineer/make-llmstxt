@@ -9,9 +9,49 @@ Scraping via your custom MCP server.
 """
 
 import os
+import re
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field
 from pathlib import Path
+
+
+def _extract_model_display_name(model_path: str) -> str:
+    """Extract a clean display name from a model file path.
+
+    Args:
+        model_path: Path to model file (e.g., "/models/Qwen-2.5-7B-Instruct-Q4_K_M.gguf")
+
+    Returns:
+        Clean display name (e.g., "Qwen-2.5-7B")
+    """
+    # Get filename without extension
+    filename = Path(model_path).stem
+
+    # Remove common quantization suffixes
+    quant_patterns = [
+        r'-[Qq]\d(_[A-Za-z\d]+)?',  # Q4_K_M, q4_k_m, Q4, etc.
+        r'-[Ii][Qq]\d+_[A-Za-z]+',   # IQ4_XS, etc.
+        r'-[Ff]\d+',                  # F16, F32, etc.
+        r'-[Bb][Pp][Ww]\d+(?:-\d+)?', # BPW4, BPW4-8, etc.
+        r'-[Ee][Xx][Ll]2',            # EXL2
+    ]
+
+    for pattern in quant_patterns:
+        filename = re.sub(pattern, '', filename)
+
+    # Remove common suffixes
+    suffixes_to_remove = [
+        '-Instruct',
+        '-instruct',
+        '-Chat',
+        '-chat',
+        '-v\d+',  # Version numbers like -v1, -v2
+    ]
+
+    for suffix in suffixes_to_remove:
+        filename = re.sub(suffix + '$', '', filename)
+
+    return filename
 
 
 class LLMConfig(BaseModel):
@@ -130,7 +170,15 @@ class AppConfig(BaseModel):
             env_key, default_base_url = provider_settings[llm_provider]
             config.llm.provider = llm_provider
             config.llm.model = os.getenv("LLM_MODEL", cls._get_default_model(llm_provider))
-            config.llm.model_display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
+
+            # Auto-derive display name from model path if not explicitly set
+            display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
+            if not display_name:
+                model_path = os.getenv("LLM_MODEL_PATH")
+                if model_path:
+                    display_name = _extract_model_display_name(model_path)
+            config.llm.model_display_name = display_name
+
             config.llm.api_key = os.getenv(env_key)
             if default_base_url:
                 config.llm.base_url = os.getenv("LLM_BASE_URL", default_base_url)
@@ -138,6 +186,15 @@ class AppConfig(BaseModel):
             # Custom provider
             config.llm.provider = llm_provider
             config.llm.model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+            # Auto-derive display name from model path if not explicitly set
+            display_name = os.getenv("LLM_MODEL_DISPLAY_NAME")
+            if not display_name:
+                model_path = os.getenv("LLM_MODEL_PATH")
+                if model_path:
+                    display_name = _extract_model_display_name(model_path)
+            config.llm.model_display_name = display_name
+
             config.llm.api_key = os.getenv("LLM_API_KEY")
             config.llm.base_url = os.getenv("LLM_BASE_URL")
 
